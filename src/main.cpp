@@ -46,14 +46,7 @@ int topR_speed;
 int bottomL_speed;
 int bottomR_speed;
 
-void sendBattery()
-{
-  radio.stopListening(); // Switch to transmit mode
-  radio.openWritingPipe(address);
-  radio.write(&power, sizeof(power));
-  radio.startListening(); // Switch back to receive mode
-  Serial.println("Power sent to antenna");
-}
+
 
 void setup()
 {
@@ -68,6 +61,7 @@ void setup()
 
   radio.setPALevel(RF24_PA_LOW);
   radio.openReadingPipe(0, address);
+  radio.enableAckPayload();
   radio.startListening();
 
   // Setup PWM for topL ESC
@@ -138,5 +132,7 @@ void loop()
       Serial.println("LT: " + String(topL_speed) + " RT: " + String(topR_speed) +
                      " LB: " + String(bottomL_speed) + " RB: " + String(bottomR_speed));
     }
+    radio.writeAckPayload(1, &power, sizeof(power));
   }
+
 }
