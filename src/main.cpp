@@ -9,7 +9,7 @@ MPU6050 mpu(Wire);
 
 const byte address[6] = "NODE1";
 
-struct joystick
+struct joystickValues
 {
   uint16_t x;
   uint16_t y;
@@ -19,9 +19,12 @@ struct joystick
 struct message
 {
   uint16_t pot1;
-  joystick joystickL;
-  joystick joystickR;
-  bool button1;
+  joystickValues joystickL;
+  joystickValues joystickR;
+
+  float roll_kp, roll_ki, roll_kd;
+  float pitch_kp, pitch_ki, pitch_kd;
+  float yaw_kp, yaw_ki, yaw_kd;
 };
 
 message Data;
@@ -171,6 +174,19 @@ void loop()
   if (radio.available())
   {
     radio.read(&Data, sizeof(Data));
+
+    // Update PID parameters from received data
+      rollPID.kp = Data.roll_kp;
+      rollPID.ki = Data.roll_ki;
+      rollPID.kd = Data.roll_kd;
+      
+      pitchPID.kp = Data.pitch_kp;
+      pitchPID.ki = Data.pitch_ki;
+      pitchPID.kd = Data.pitch_kd;
+      
+      yawPID.kp = Data.yaw_kp;
+      yawPID.ki = Data.yaw_ki;
+      yawPID.kd = Data.yaw_kd;
 
     base_motor_speed = map(Data.pot1, 0, 1023, 0, 150);
 
