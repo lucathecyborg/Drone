@@ -1,0 +1,165 @@
+/*
+ * ESP32 - E01-ML01DP5 (nRF24L01P) Receiver
+ * Receives potentiometer value and outputs to Serial
+ * 
+ * Wiring:
+ * E01-ML01DP5 -> ESP32
+ * VCC -> 3.3V (IMPORTANT!)
+ * GND -> GND
+ * CE -> GPIO 4
+ * CSN -> GPIO 5
+ * SCK -> GPIO 18 (VSPI)
+ * MOSI -> GPIO 23 (VSPI)
+ * MISO -> GPIO 19 (VSPI)
+ * IRQ -> Not connected
+ * 
+ * TROUBLESHOOTING:
+ * 1. Try different CE/CSN pins (e.g., CE=22, CSN=21)
+ * 2. Add 10µF capacitor between VCC and GND near module
+ * 3. Keep wires SHORT (< 10cm ideally)
+ * 4. Use external 3.3V power if ESP32 can't supply enough current
+ */
+
+#include <SPI.h>
+#include <RF24.h>
+
+// Pin definitions - TRY THESE ALTERNATIVES IF IT DOESN'T WORK:
+// Option 1 (default):
+#define CE_PIN 4
+#define CSN_PIN 5
+
+// Option 2 (uncomment to try):
+// #define CE_PIN 22
+// #define CSN_PIN 21
+
+// Option 3 (uncomment to try):
+// #define CE_PIN 15
+// #define CSN_PIN 2
+
+// Create RF24 object
+RF24 radio(CE_PIN, CSN_PIN);
+
+// Set up address for communication (must match transmitter)
+const byte address[6] = "00001";
+
+void setup() {
+  // Initialize Serial for output
+  Serial.begin(115200);
+  delay(1000); // Give time for Serial to initialize
+  
+  Serial.println("\n\n=== ESP32 RF24 Receiver ===");
+  Serial.println("Attempting to initialize RF24 module...");
+  
+  // Test SPI communication first
+  Serial.println("\nTesting SPI pins...");
+  Serial.print("SCK (18): ");
+  pinMode(18, OUTPUT);
+  digitalWrite(18, HIGH);
+  Serial.println(digitalRead(18) ? "OK" : "FAIL");
+  
+  Serial.print("MOSI (23): ");
+  pinMode(23, OUTPUT);
+  digitalWrite(23, HIGH);
+  Serial.println(digitalRead(23) ? "OK" : "FAIL");
+  
+  Serial.print("MISO (19): ");
+  pinMode(19, INPUT);
+  Serial.println("INPUT mode set");
+  
+  Serial.print("CE (4): ");
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  Serial.println(digitalRead(4) ? "OK" : "FAIL");
+  
+  Serial.print("CSN (5): ");
+  pinMode(5, OUTPUT);
+  digitalWrite(5, HIGH);
+  Serial.println(digitalRead(5) ? "OK" : "FAIL");
+  
+  delay(500);
+  
+  // Explicitly initialize SPI with correct pins
+  Serial.println("\nInitializing SPI bus (VSPI)...");
+  SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
+  delay(100);
+  
+  // Force CSN high before radio.begin()
+  digitalWrite(5, HIGH);
+  delay(10);
+  
+  // Try to initialize RF24 with extended timeout
+  Serial.println("Initializing RF24...");
+  int attempts = 0;
+  while (!radio.begin(&SPI, CE_PIN, CSN_PIN) && attempts < 5) {
+    attempts++;
+    Serial.print("Attempt ");
+    Serial.print(attempts);
+    Serial.println(" failed."); 
+    
+    // Try toggling CSN
+    digitalWrite(5, LOW);
+    delay(10);
+    digitalWrite(5, HIGH);
+    delay(100);
+  }
+  
+  if (attempts >= 5) {
+    Serial.println("\n!!! RF24 module failed to initialize !!!");
+    Serial.println("\nDEBUG INFO:");
+    Serial.println("- Same wiring worked before? Check for loose connections");
+    Serial.println("- Try uploading your OLD working code to confirm hardware");
+    Serial.println("- Library version issue? Try RF24 library v1.4.5");
+    Serial.println("- ESP32 board variant issue? Check board selection");
+    Serial.println("\nPossible fixes:");
+    Serial.println("1. Downgrade RF24 library to version that worked");
+    Serial.println("2. Try: radio.begin(&SPI, CE_PIN, CSN_PIN) syntax");
+    Serial.println("3. Add radio.failureDetected = 0 before begin()");
+    Serial.println("4. Power cycle everything (unplug USB)");
+    while (1); // Halt
+  }
+  
+  Serial.println("✓ SUCCESS! RF24 initialized.");
+  
+  // Read and print chip details to verify communication
+  Serial.println("\nReading RF24 registers...");
+  radio.printDetails();
+  
+  // Configure RF24 settings
+  radio.setPALevel(RF24_PA_LOW);   // Start with LOW power for testing
+  radio.setDataRate(RF24_1MBPS);   // Use 1Mbps for more reliable initialization
+  radio.setChannel(108);            // Use channel 108 (2.508 GHz)
+  
+  // Add delay before pipe configuration
+  delay(100);
+  
+  radio.openReadingPipe(1, address); // Set receive address
+  radio.startListening();            // Put in receive mode
+  
+  // Print diagnostic info
+  Serial.println("\n--- Configuration ---");
+  Serial.print("CE Pin: ");
+  Serial.println(CE_PIN);
+  Serial.print("CSN Pin: ");
+  Serial.println(CSN_PIN);
+  Serial.println("PA Level: LOW (for testing)");
+  Serial.println("Data Rate: 1Mbps");
+  Serial.println("Listening on channel 108");
+  Serial.println("Waiting for data...\n");
+}
+
+void loop() {
+  // Check if data is available
+  if (radio.available()) {
+    int potValue;
+    
+    // Read the data
+    radio.read(&potValue, sizeof(potValue));
+    
+    // Output to serial
+    Serial.print("Potentiometer Value: ");
+    Serial.print(potValue);
+    Serial.print(" (");
+    Serial.print(map(potValue, 0, 1023, 0, 100));
+    Serial.println("%)");
+  }
+}

@@ -4,7 +4,10 @@
 #include <Arduino.h>
 #include <MPU6050_light.h>
 
-RF24 radio(2, 4); // CE, CSN
+
+#define CE_PIN 4
+#define CSN_PIN 5
+RF24 radio(CE_PIN, CSN_PIN); // CE, CSN
 MPU6050 mpu(Wire);
 
 const byte address[6] = "NODE1";
@@ -22,9 +25,9 @@ struct message
   joystickValues joystickL;
   joystickValues joystickR;
 
-  float roll_kp, roll_ki, roll_kd;
+ /* float roll_kp, roll_ki, roll_kd;
   float pitch_kp, pitch_ki, pitch_kd;
-  float yaw_kp, yaw_ki, yaw_kd;
+  float yaw_kp, yaw_ki, yaw_kd; */
 };
 
 message Data;
@@ -109,7 +112,7 @@ void setup()
   Wire.begin();
 
   // Initialize MPU6050
-  byte status = mpu.begin();
+ /* byte status = mpu.begin();
   Serial.print("MPU6050 status: ");
   Serial.println(status);
   
@@ -121,16 +124,27 @@ void setup()
   Serial.println("Calibrating gyro... Keep drone still!");
   delay(1000);
   mpu.calcOffsets();
-  Serial.println("Calibration complete!");
+  Serial.println("Calibration complete!"); */
+ Serial.println("\nInitializing SPI bus (VSPI)...");
+  SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
+  delay(100);
+  
+  // Force CSN high before radio.begin()
+  digitalWrite(5, HIGH);
+  delay(10);
 
-  if (!radio.begin())
+  
+  if (!radio.begin(&SPI, CE_PIN, CSN_PIN))
   {
     Serial.println("NRF24L01 not responding");
     while (1);
   }
 
   radio.setPALevel(RF24_PA_LOW);
-  radio.openReadingPipe(0, address);
+  radio.setDataRate(RF24_1MBPS);
+  radio.setChannel(108);
+  delay(100);
+  radio.openReadingPipe(1, address);
   radio.enableAckPayload();
   radio.startListening();
 
@@ -169,14 +183,14 @@ void loop()
   unsigned long now = millis();
   
   // Update MPU6050 data
-  mpu.update();
+ // mpu.update();
   
   if (radio.available())
   {
     radio.read(&Data, sizeof(Data));
 
     // Update PID parameters from received data
-      rollPID.kp = Data.roll_kp;
+    /*  rollPID.kp = Data.roll_kp;
       rollPID.ki = Data.roll_ki;
       rollPID.kd = Data.roll_kd;
       
@@ -186,7 +200,7 @@ void loop()
       
       yawPID.kp = Data.yaw_kp;
       yawPID.ki = Data.yaw_ki;
-      yawPID.kd = Data.yaw_kd;
+      yawPID.kd = Data.yaw_kd; */
 
     base_motor_speed = map(Data.pot1, 0, 1023, 0, 150);
 
