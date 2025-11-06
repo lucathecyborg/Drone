@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <MPU6050_light.h>
 
-
 #define CE_PIN 4
 #define CSN_PIN 5
 RF24 radio(CE_PIN, CSN_PIN); // CE, CSN
@@ -25,7 +24,7 @@ struct message
   joystickValues joystickL;
   joystickValues joystickR;
 
- /* float roll_kp, roll_ki, roll_kd;
+  /* float roll_kp, roll_ki, roll_kd;
   float pitch_kp, pitch_ki, pitch_kd;
   float yaw_kp, yaw_ki, yaw_kd; */
 };
@@ -55,15 +54,15 @@ struct PID {
   unsigned long lastTime;
 };
 
-// PID controllers for roll, pitch, yaw
-PID rollPID = {1.5, 0.05, 0.8, 0, 0, 400, 0};
-PID pitchPID = {1.5, 0.05, 0.8, 0, 0, 400, 0};
-PID yawPID = {2.0, 0.02, 0.5, 0, 0, 400, 0};
+// PID controllers for roll, pitch (angle mode), yaw (rate mode)
+PID rollPID = {0.8, 0.02, 0.4, 0, 0, 400, 0};
+PID pitchPID = {0.8, 0.02, 0.4, 0, 0, 400, 0};
+PID yawPID = {1.5, 0.01, 0.05, 0, 0, 400, 0}; // Rate mode gains
 
-// Target angles from joystick
+// Target angles/rates from joystick
 float targetRoll = 0;
 float targetPitch = 0;
-float targetYaw = 0;
+float targetYawRate = 0; // Changed to rate instead of angle
 
 int base_motor_speed;
 uint16_t power = 69;
@@ -74,7 +73,6 @@ int bottomL_speed;
 int bottomR_speed;
 
 unsigned long lastPrint = 0;
-unsigned long lastIMURead = 0;
 
 float computePID(PID *pid, float setpoint, float measured) {
   unsigned long now = micros();
@@ -112,7 +110,9 @@ void setup()
   Wire.begin();
 
   // Initialize MPU6050
- /* byte status = mpu.begin();
+  // NOTE: MPU6050 is mounted FLAT (chip and LED facing UP)
+  // X-axis = Roll, Y-axis = Pitch, Z-axis = Yaw
+  byte status = mpu.begin();
   Serial.print("MPU6050 status: ");
   Serial.println(status);
   
@@ -121,11 +121,12 @@ void setup()
     while (1);
   }
   
-  Serial.println("Calibrating gyro... Keep drone still!");
+  Serial.println("Calibrating gyro... Keep drone FLAT and STILL!");
   delay(1000);
   mpu.calcOffsets();
-  Serial.println("Calibration complete!"); */
- Serial.println("\nInitializing SPI bus (VSPI)...");
+  Serial.println("Calibration complete!"); 
+  
+  Serial.println("\nInitializing SPI bus (VSPI)...");
   SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
   delay(100);
   
@@ -133,7 +134,6 @@ void setup()
   digitalWrite(5, HIGH);
   delay(10);
 
-  
   if (!radio.begin(&SPI, CE_PIN, CSN_PIN))
   {
     Serial.println("NRF24L01 not responding");
@@ -183,14 +183,14 @@ void loop()
   unsigned long now = millis();
   
   // Update MPU6050 data
- // mpu.update();
+  mpu.update();
   
   if (radio.available())
   {
     radio.read(&Data, sizeof(Data));
 
-    // Update PID parameters from received data
-    /*  rollPID.kp = Data.roll_kp;
+    // Update PID parameters from received data (commented out for now)
+    /* rollPID.kp = Data.roll_kp;
       rollPID.ki = Data.roll_ki;
       rollPID.kd = Data.roll_kd;
       
@@ -202,34 +202,63 @@ void loop()
       yawPID.ki = Data.yaw_ki;
       yawPID.kd = Data.yaw_kd; */
 
-    base_motor_speed = map(Data.pot1, 0, 1023, 0, 150);
+    // Increased throttle range and minimum for ESC response
+    base_motor_speed = map(Data.pot1, 0, 1023, 40, 180);
 
-    // Map joystick to target angles (±30 degrees)
+    // Map joystick to target angles (±30 degrees for roll/pitch)
     targetRoll = map(Data.joystickL.x, 0, 1023, -30, 30);
     targetPitch = map(Data.joystickL.y, 0, 1023, -30, 30);
     
-    // Use right joystick for yaw rate
-    float yawRate = map(Data.joystickR.x, 0, 1023, -100, 100);
-    targetYaw += yawRate * 0.01;
+    // Apply deadband to prevent drift
+    if (abs(targetRoll) < 3.0) targetRoll = 0;
+    if (abs(targetPitch) < 3.0) targetPitch = 0;
+    
+    // Use right joystick for yaw RATE (degrees per second)
+    targetYawRate = map(Data.joystickR.x, 0, 1023, -150, 150);
+    if (abs(targetYawRate) < 10) targetYawRate = 0; // Deadband for yaw
+    
+    // DEBUG: Print joystick values to diagnose the issue
+    static unsigned long lastJoyPrint = 0;
+    if (now - lastJoyPrint > 1000) {
+      lastJoyPrint = now;
+      Serial.print("JoyL: "); Serial.print(Data.joystickL.x);
+      Serial.print(","); Serial.print(Data.joystickL.y);
+      Serial.print(" | JoyR: "); Serial.print(Data.joystickR.x);
+      Serial.print(","); Serial.println(Data.joystickR.y);
+    }
 
     // Only apply PID when throttle is above minimum
-    if (base_motor_speed > 30)
+    if (base_motor_speed > 40)
     {
-      // Get current angles from MPU6050
-      float currentRoll = mpu.getAngleX();
-      float currentPitch = mpu.getAngleY();
-      float currentYaw = mpu.getAngleZ();
+      // Get current angles and rates from MPU6050 (mounted flat)
+      float currentRoll = mpu.getAngleX();   // X-axis = Roll
+      float currentPitch = mpu.getAngleY();  // Y-axis = Pitch
+      float currentYawRate = mpu.getGyroZ(); // Z-axis gyro rate for yaw
       
       // Compute PID corrections
       float rollCorrection = computePID(&rollPID, targetRoll, currentRoll);
       float pitchCorrection = computePID(&pitchPID, targetPitch, currentPitch);
-      float yawCorrection = computePID(&yawPID, targetYaw, currentYaw);
+      float yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
 
-      // Apply corrections to motors
-      topL_speed = base_motor_speed - pitchCorrection - rollCorrection + yawCorrection;
-      topR_speed = base_motor_speed - pitchCorrection + rollCorrection - yawCorrection;
-      bottomL_speed = base_motor_speed + pitchCorrection - rollCorrection - yawCorrection;
-      bottomR_speed = base_motor_speed + pitchCorrection + rollCorrection + yawCorrection;
+      // Limit corrections to prevent motor saturation
+      float maxCorrection = min(60.0f, (180.0f - base_motor_speed) / 2.0f);
+      rollCorrection = constrain(rollCorrection, -maxCorrection, maxCorrection);
+      pitchCorrection = constrain(pitchCorrection, -maxCorrection, maxCorrection);
+      yawCorrection = constrain(yawCorrection, -40.0f, 40.0f);
+
+      // Apply corrections to motors (X configuration, MPU flat)
+      // Motor layout:
+      //     FRONT
+      //   topL  topR
+      //      \ /
+      //       X
+      //      / \
+      // bottomL bottomR
+      //     BACK
+      topL_speed = base_motor_speed + pitchCorrection - rollCorrection - yawCorrection;
+      topR_speed = base_motor_speed + pitchCorrection + rollCorrection + yawCorrection;
+      bottomL_speed = base_motor_speed - pitchCorrection - rollCorrection + yawCorrection;
+      bottomR_speed = base_motor_speed - pitchCorrection + rollCorrection - yawCorrection;
 
       // Constrain motor speeds
       topL_speed = constrain(topL_speed, 0, 180);
@@ -240,10 +269,10 @@ void loop()
     else
     {
       // Reset PID when disarmed
-      topL_speed = base_motor_speed;
-      topR_speed = base_motor_speed;
-      bottomL_speed = base_motor_speed;
-      bottomR_speed = base_motor_speed;
+      topL_speed = 0;
+      topR_speed = 0;
+      bottomL_speed = 0;
+      bottomR_speed = 0;
       
       resetPID(&rollPID);
       resetPID(&pitchPID);
@@ -259,10 +288,20 @@ void loop()
     if (now - lastPrint > 200)
     {
       lastPrint = now;
-      Serial.println("R:" + String(mpu.getAngleX(), 1) + " P:" + String(mpu.getAngleY(), 1) + 
-                     " Y:" + String(mpu.getAngleZ(), 1) + " | LT:" + String(topL_speed) + 
-                     " RT:" + String(topR_speed) + " LB:" + String(bottomL_speed) + 
-                     " RB:" + String(bottomR_speed));
+      
+      // Detailed diagnostics
+      Serial.print("Base: "); Serial.print(base_motor_speed);
+      Serial.print(" | R:"); Serial.print(mpu.getAngleX(), 1);
+      Serial.print(" P:"); Serial.print(mpu.getAngleY(), 1);
+      Serial.print(" YawRate:"); Serial.print(mpu.getGyroZ(), 1);
+      Serial.print(" | tR:"); Serial.print(targetRoll, 1);
+      Serial.print(" tP:"); Serial.print(targetPitch, 1);
+      Serial.print(" tYR:"); Serial.print(targetYawRate, 1);
+      Serial.print(" | Motors: ");
+      Serial.print(topL_speed); Serial.print(",");
+      Serial.print(topR_speed); Serial.print(",");
+      Serial.print(bottomL_speed); Serial.print(",");
+      Serial.println(bottomR_speed);
     }
     
     radio.writeAckPayload(1, &power, sizeof(power));
