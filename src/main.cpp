@@ -23,11 +23,14 @@ struct message
   uint16_t pot1;
   joystickValues joystickL;
   joystickValues joystickR;
+  uint8_t PidAxis=3; // 0 = pitch, 1 = roll, 2 = yaw
+  float kp=1.5, ki=0.05, kd=0.8;
 
-  /* float roll_kp, roll_ki, roll_kd;
-  float pitch_kp, pitch_ki, pitch_kd;
-  float yaw_kp, yaw_ki, yaw_kd; */
+
 };
+
+
+
 
 message Data;
 
@@ -188,19 +191,25 @@ void loop()
   if (radio.available())
   {
     radio.read(&Data, sizeof(Data));
-
-    // Update PID parameters from received data (commented out for now)
-    /* rollPID.kp = Data.roll_kp;
-      rollPID.ki = Data.roll_ki;
-      rollPID.kd = Data.roll_kd;
-      
-      pitchPID.kp = Data.pitch_kp;
-      pitchPID.ki = Data.pitch_ki;
-      pitchPID.kd = Data.pitch_kd;
-      
-      yawPID.kp = Data.yaw_kp;
-      yawPID.ki = Data.yaw_ki;
-      yawPID.kd = Data.yaw_kd; */
+    if(Data.PidAxis < 3){
+      switch(Data.PidAxis){
+        case 0:
+          pitchPID.kp = Data.kp;
+          pitchPID.ki = Data.ki;
+          pitchPID.kd = Data.kd;
+          break;
+        case 1:
+          rollPID.kp = Data.kp;
+          rollPID.ki = Data.ki;
+          rollPID.kd = Data.kd;
+          break;
+        case 2:
+          yawPID.kp = Data.kp;
+          yawPID.ki = Data.ki;
+          yawPID.kd = Data.kd;
+          break;
+      }
+    }
 
     // Increased throttle range and minimum for ESC response
     base_motor_speed = map(Data.pot1, 0, 1023, 40, 180);
