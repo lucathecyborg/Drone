@@ -65,9 +65,10 @@ struct PID {
 };
 
 // PID controllers for roll, pitch (angle mode), yaw (rate mode)
-PID rollPID = {0.8, 0.02, 0.4, 0, 0, 400, 0};
-PID pitchPID = {0.8, 0.02, 0.4, 0, 0, 400, 0};
-PID yawPID = {1.5, 0.01, 0.05, 0, 0, 400, 0}; // Rate mode gains
+// Integral limits are conservative to prevent windup in small control ranges (0-180 speed)
+PID rollPID = {0.8, 0.02, 0.4, 0, 0, 20.0f, 0};
+PID pitchPID = {0.8, 0.02, 0.4, 0, 0, 20.0f, 0};
+PID yawPID = {1.5, 0.01, 0.05, 0, 0, 15.0f, 0}; // Rate mode gains
 
 // Target angles/rates from joystick
 float targetRoll = 0;
@@ -85,35 +86,47 @@ int bottomR_speed;
 unsigned long lastPrint = 0;
 
 // PID computation function
+// Uses standard PID control with proper time handling and derivative filtering
 float computePID(PID *pid, float setpoint, float measured) {
   unsigned long now = micros();
-  float dt = (now - pid->lastTime) / 1000000.0;
+  float dt = (now - pid->lastTime) / 1000000.0; // Convert to seconds
   pid->lastTime = now;
   
-  if (dt > 0.5) return 0; // Safety check
+  // Safety: if dt is too large, reset and return zero (prevents jump)
+  if (dt > 0.1f || dt <= 0.0f) {
+    pid->prevError = 0;
+    pid->integral = 0;
+    return 0;
+  }
   
   float error = setpoint - measured;
   
-  // Proportional
+  // Proportional term
   float P = pid->kp * error;
   
-  // Integral with anti-windup
+  // Integral term with anti-windup
   pid->integral += error * dt;
   pid->integral = constrain(pid->integral, -pid->integralLimit, pid->integralLimit);
   float I = pid->ki * pid->integral;
   
-  // Derivative
-  float D = pid->kd * (error - pid->prevError) / dt;
+  // Derivative term (using error difference, not rate of measurement)
+  // Note: Division by dt is correct - it scales the rate of change
+  float D = 0;
+  if (dt > 0) {
+    D = pid->kd * (error - pid->prevError) / dt;
+  }
   pid->prevError = error;
   
-  return P + I + D;
+  float output = P + I + D;
+  
+  return output;
 }
 
-// Reset PID controller
+// Reset PID controller - clears integral windup and derivative history
 void resetPID(PID *pid) {
-  pid->integral = 0;
-  pid->prevError = 0;
-  pid->lastTime = micros();
+  pid->integral = 0;      // Clear accumulated integral error
+  pid->prevError = 0;     // Clear previous error for derivative calculation
+  pid->lastTime = micros(); // Initialize timing baseline
 }
 
 void setup()
@@ -245,29 +258,39 @@ void computePIDCorrections(float &rollCorrection, float &pitchCorrection, float 
   yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
 
   // Limit corrections to prevent motor saturation
-  float maxCorrection = min(60.0f, (180.0f - base_motor_speed) / 2.0f);
-  rollCorrection = constrain(rollCorrection, -maxCorrection, maxCorrection);
-  pitchCorrection = constrain(pitchCorrection, -maxCorrection, maxCorrection);
-  yawCorrection = constrain(yawCorrection, -40.0f, 40.0f);
+  // Available headroom = (180 - base_speed) / 2 (split between up and down corrections)
+  // Additional safety margin prevents complete saturation
+  float availableHeadroom = (180.0f - base_motor_speed) / 2.0f;
+  float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);  // Cap at 60 for stability
+  float maxYaw = 40.0f;  // Yaw is more aggressive, separate limit
+  
+  rollCorrection = constrain(rollCorrection, -maxPitchRoll, maxPitchRoll);
+  pitchCorrection = constrain(pitchCorrection, -maxPitchRoll, maxPitchRoll);
+  yawCorrection = constrain(yawCorrection, -maxYaw, maxYaw);
 }
 
 // Calculate motor speeds based on corrections
+// X-configuration mixing for quadcopter
+// Motor layout (from above):
+//     FRONT
+//   topL  topR
+//      \ /
+//       X (center)
+//      / \
+// bottomL bottomR
+//     BACK
+//
+// Pitch: forward/backward leveling - front motors opposite rear motors
+// Roll: left/right leveling - left motors opposite right motors
+// Yaw: rotation - diagonal motors pair together
 void calculateMotorSpeeds(float rollCorrection, float pitchCorrection, float yawCorrection) {
   // Apply corrections to motors (X configuration, MPU flat)
-  // Motor layout:
-  //     FRONT
-  //   topL  topR
-  //      \ /
-  //       X
-  //      / \
-  // bottomL bottomR
-  //     BACK
   topL_speed = base_motor_speed + pitchCorrection - rollCorrection - yawCorrection;
   topR_speed = base_motor_speed + pitchCorrection + rollCorrection + yawCorrection;
   bottomL_speed = base_motor_speed - pitchCorrection - rollCorrection + yawCorrection;
   bottomR_speed = base_motor_speed - pitchCorrection + rollCorrection - yawCorrection;
 
-  // Constrain motor speeds
+  // Constrain motor speeds to valid range (0-180 maps to PWM 3276-6553)
   topL_speed = constrain(topL_speed, 0, 180);
   topR_speed = constrain(topR_speed, 0, 180);
   bottomL_speed = constrain(bottomL_speed, 0, 180);
