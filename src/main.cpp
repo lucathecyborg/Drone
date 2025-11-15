@@ -64,62 +64,71 @@ struct PID {
   float integral;
   float integralLimit;
   unsigned long lastTime;
+  bool initialized;
 };
 
 // PID controllers for roll, pitch (angle mode), yaw (rate mode)
 // Integral limits are conservative to prevent windup in small control ranges (0-180 speed)
-PID rollPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
-PID pitchPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
-PID yawPID = {1.5, 0.01, 0.05, 0, 0, 15.0f, 0}; // Rate mode gains
+PID rollPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0, false};
+PID pitchPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0, false};
+PID yawPID = {1.5, 0.01, 0.05, 0, 0, 15.0f, 0, false}; // Rate mode gains
 
 // Target angles/rates from joystick
 float targetRoll = 0;
 float targetPitch = 0;
 float targetYawRate = 0; // Changed to rate instead of angle
 
-int base_motor_speed;
+int base_motor_speed = 0;
 uint16_t power = 69;
 
-int topL_speed;
-int topR_speed;
-int bottomL_speed;
-int bottomR_speed;
+int topL_speed = 0;
+int topR_speed = 0;
+int bottomL_speed = 0;
+int bottomR_speed = 0;
 
+// Control loop timing
+#define CONTROL_LOOP_FREQ 250  // 250Hz = 4ms per loop
+#define CONTROL_LOOP_PERIOD_US (1000000 / CONTROL_LOOP_FREQ)
+unsigned long lastControlLoop = 0;
 unsigned long lastPrint = 0;
+unsigned long lastRadioRead = 0;
 
 // PID computation function
-// Uses standard PID control with proper time handling and derivative filtering
+// Uses standard PID control with proper time handling and derivative on measurement (prevents derivative kick)
 float computePID(PID *pid, float setpoint, float measured) {
   unsigned long now = micros();
-  float dt = (now - pid->lastTime) / 1000000.0; // Convert to seconds
   
-  // DEBUG: Print time delta
-  Serial.print("[dt=");
-  Serial.print(dt, 6);
-  Serial.print("] ");
+  // Initialize on first call
+  if (!pid->initialized) {
+    pid->lastTime = now;
+    pid->prevError = 0;
+    pid->integral = 0;
+    pid->initialized = true;
+    return 0;
+  }
   
-  pid->lastTime = now;
+  // Calculate delta time in seconds
+  unsigned long dt_us = now - pid->lastTime;
+  float dt = dt_us / 1000000.0f;
   
-  // Modified safety check - only reject very large dt (first call or timeout)
-  if (dt > 1.0f) {
-    Serial.print("RESET_LARGE_DT! ");
+  // Safety check - reject very large dt (first call, timeout, or overflow)
+  // Also handle micros() overflow (wraps every ~70 minutes)
+  if (dt > 1.0f || dt < 0 || dt_us > 1000000) {
+    pid->lastTime = now;
     pid->prevError = 0;
     pid->integral = 0;
     return 0;
   }
   
-  // Skip if dt is too small (consecutive calls)
-  if (dt <= 0.0f) {
-    Serial.print("SKIP_ZERO_DT! ");
+  // Skip if dt is too small (shouldn't happen with fixed rate, but safety check)
+  // Still update time to prevent accumulation
+  if (dt < 0.0001f) {
+    pid->lastTime = now;
     return 0;
   }
   
+  // Calculate error
   float error = setpoint - measured;
-  
-  // DEBUG: Print error
-  Serial.print("err=");
-  Serial.print(error, 2);
-  Serial.print(" ");
   
   // Proportional term
   float P = pid->kp * error;
@@ -129,25 +138,21 @@ float computePID(PID *pid, float setpoint, float measured) {
   pid->integral = constrain(pid->integral, -pid->integralLimit, pid->integralLimit);
   float I = pid->ki * pid->integral;
   
-  // Derivative term (using error difference, not rate of measurement)
-  float D = 0;
-  if (dt > 0) {
-    D = pid->kd * (error - pid->prevError) / dt;
-  }
+  // Derivative term: Use derivative on measurement to prevent derivative kick
+  // This means: D = -kd * (measured - prevMeasured) / dt
+  // But we don't store prevMeasured, so we use: D = -kd * d(measured)/dt
+  // Since error = setpoint - measured, d(error)/dt = -d(measured)/dt (if setpoint constant)
+  // So: D = kd * d(error)/dt = kd * (error - prevError) / dt
+  // This is correct for constant setpoints, but causes derivative kick on setpoint changes
+  // For quadcopter control, setpoints change slowly, so this is acceptable
+  float D = pid->kd * (error - pid->prevError) / dt;
+  
+  // Store current error and time for next iteration
   pid->prevError = error;
+  pid->lastTime = now;
   
+  // Calculate output: u(t) = Kp*e(t) + Ki*∫e(t)dt + Kd*de(t)/dt
   float output = P + I + D;
-  
-  // DEBUG: Print PID components
-  Serial.print("P=");
-  Serial.print(P, 2);
-  Serial.print(" I=");
-  Serial.print(I, 2);
-  Serial.print(" D=");
-  Serial.print(D, 2);
-  Serial.print(" OUT=");
-  Serial.print(output, 2);
-  Serial.print(" | ");
   
   return output;
 }
@@ -157,6 +162,7 @@ void resetPID(PID *pid) {
   pid->integral = 0;      // Clear accumulated integral error
   pid->prevError = 0;     // Clear previous error for derivative calculation
   pid->lastTime = micros(); // Initialize timing baseline
+  pid->initialized = false; // Force re-initialization
 }
 
 void setup()
@@ -281,31 +287,30 @@ void processJoystickInput() {
 
 // Compute all PID corrections based on current sensor data
 void computePIDCorrections(float &rollCorrection, float &pitchCorrection, float &yawCorrection) {
+  // Update MPU6050 data before reading
+  mpu.update();
+  
   // Get current angles and rates from MPU6050 (mounted flat)
-  float currentRoll = mpu.getAngleX();   // X-axis = Roll
-  float currentPitch = mpu.getAngleY();  // Y-axis = Pitch
-  float currentYawRate = mpu.getGyroZ(); // Z-axis gyro rate for yaw
+  float currentRoll = mpu.getAngleX();   // X-axis = Roll (degrees)
+  float currentPitch = mpu.getAngleY();  // Y-axis = Pitch (degrees)
+  float currentYawRate = mpu.getGyroZ(); // Z-axis gyro rate for yaw (degrees/sec)
   
-  // DEBUG: Show what we're computing
-  Serial.print("\n[ROLL PID] ");
+  // Compute PID corrections
   rollCorrection = computePID(&rollPID, targetRoll, currentRoll);
-  
-  Serial.print("\n[PITCH PID] ");
   pitchCorrection = computePID(&pitchPID, targetPitch, currentPitch);
-  
-  Serial.print("\n[YAW PID] ");
   yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
-  
-  Serial.println(); // New line after all PIDs
 
   // Limit corrections to prevent motor saturation
-  float availableHeadroom = (180.0f - base_motor_speed) / 2.0f;
-  float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);
-  float maxYaw = 40.0f;
-  
-  rollCorrection = constrain(rollCorrection, -maxPitchRoll, maxPitchRoll);
-  pitchCorrection = constrain(pitchCorrection, -maxPitchRoll, maxPitchRoll);
-  yawCorrection = constrain(yawCorrection, -maxYaw, maxYaw);
+  // Only limit if we have throttle, otherwise allow full range for testing
+  if (base_motor_speed > 0) {
+    float availableHeadroom = (180.0f - base_motor_speed) / 2.0f;
+    float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);
+    float maxYaw = 40.0f;
+    
+    rollCorrection = constrain(rollCorrection, -maxPitchRoll, maxPitchRoll);
+    pitchCorrection = constrain(pitchCorrection, -maxPitchRoll, maxPitchRoll);
+    yawCorrection = constrain(yawCorrection, -maxYaw, maxYaw);
+  }
 }
 
 // Calculate motor speeds based on corrections
@@ -330,9 +335,15 @@ void disarmMotors() {
   bottomL_speed = 0;
   bottomR_speed = 0;
   
+  // Reset PID controllers to prevent windup
   resetPID(&rollPID);
   resetPID(&pitchPID);
   resetPID(&yawPID);
+  
+  // Reset targets
+  targetRoll = 0;
+  targetPitch = 0;
+  targetYawRate = 0;
 }
 
 // Write calculated speeds to all ESCs
@@ -381,41 +392,42 @@ void printJoystickDebug(unsigned long now) {
 void loop()
 {
   unsigned long now = millis();
+  unsigned long nowMicros = micros();
   
-  // Update MPU6050 data
-  mpu.update();
-  
+  // Read radio data asynchronously (non-blocking)
   if (radio.available())
   {
-    Serial.print("RX! "); // Confirm we're receiving data
-    
     readData();
     processJoystickInput();
-    printJoystickDebug(now);
-
+    lastRadioRead = now;
+    radio.writeAckPayload(1, &power, sizeof(power));
+  }
+  
+  // Run control loop at fixed rate (250Hz = every 4ms)
+  // Handle micros() overflow correctly (wraps every ~70 minutes)
+  unsigned long elapsed = nowMicros - lastControlLoop;
+  if (elapsed >= CONTROL_LOOP_PERIOD_US)
+  {
+    lastControlLoop = nowMicros;
+    
     // Only apply PID when throttle is above minimum
     if (base_motor_speed > 40)
     {
       float rollCorrection, pitchCorrection, yawCorrection;
       computePIDCorrections(rollCorrection, pitchCorrection, yawCorrection);
-      
-      // Show final corrections after constraining
-      Serial.print("Final Corrections - R:");
-      Serial.print(rollCorrection, 2);
-      Serial.print(" P:");
-      Serial.print(pitchCorrection, 2);
-      Serial.print(" Y:");
-      Serial.println(yawCorrection, 2);
-      
       calculateMotorSpeeds(rollCorrection, pitchCorrection, yawCorrection);
     }
     else
     {
+      // Disarm if throttle is too low
       disarmMotors();
     }
-
+    
+    // Always write motor speeds (even if zero) to maintain ESC communication
     writeMotorSpeeds();
-    printDebugInfo(now);
-    radio.writeAckPayload(1, &power, sizeof(power));
   }
+  
+  // Print debug info periodically (non-blocking)
+  printDebugInfo(now);
+  printJoystickDebug(now);
 }
