@@ -32,24 +32,26 @@ MPU6050 mpu(Wire);
 
 
 //Data structure for joysticks
+#pragma pack(push,1)
 struct joystickValues
 {
   uint16_t x;
   uint16_t y;
   bool button;
 };
+#pragma pack(pop)
 
 //Data structure for incomming radio communication (max 32 bytes)
+#pragma pack(push,1)
 struct message
 {
   uint16_t pot1;
   joystickValues joystickL;
   joystickValues joystickR;
-  uint8_t PidAxis=3; // 0 = pitch, 1 = roll, 2 = yaw
-  float kp=1.5, ki=0.05, kd=0.8;
-
+  uint8_t PidAxis; // 0 = pitch, 1 = roll, 2 = yaw
+  float kp, ki, kd;
 };
-
+#pragma pack(pop)
 // Received data
 message Data;
 
@@ -66,8 +68,8 @@ struct PID {
 
 // PID controllers for roll, pitch (angle mode), yaw (rate mode)
 // Integral limits are conservative to prevent windup in small control ranges (0-180 speed)
-PID rollPID = {0.8, 0.02, 0.4, 0, 0, 20.0f, 0};
-PID pitchPID = {0.8, 0.02, 0.4, 0, 0, 20.0f, 0};
+PID rollPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
+PID pitchPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
 PID yawPID = {1.5, 0.01, 0.05, 0, 0, 15.0f, 0}; // Rate mode gains
 
 // Target angles/rates from joystick
@@ -90,16 +92,34 @@ unsigned long lastPrint = 0;
 float computePID(PID *pid, float setpoint, float measured) {
   unsigned long now = micros();
   float dt = (now - pid->lastTime) / 1000000.0; // Convert to seconds
+  
+  // DEBUG: Print time delta
+  Serial.print("[dt=");
+  Serial.print(dt, 6);
+  Serial.print("] ");
+  
   pid->lastTime = now;
   
-  // Safety: if dt is too large, reset and return zero (prevents jump)
-  if (dt > 0.1f || dt <= 0.0f) {
+  // Modified safety check - only reject very large dt (first call or timeout)
+  if (dt > 1.0f) {
+    Serial.print("RESET_LARGE_DT! ");
     pid->prevError = 0;
     pid->integral = 0;
     return 0;
   }
   
+  // Skip if dt is too small (consecutive calls)
+  if (dt <= 0.0f) {
+    Serial.print("SKIP_ZERO_DT! ");
+    return 0;
+  }
+  
   float error = setpoint - measured;
+  
+  // DEBUG: Print error
+  Serial.print("err=");
+  Serial.print(error, 2);
+  Serial.print(" ");
   
   // Proportional term
   float P = pid->kp * error;
@@ -110,7 +130,6 @@ float computePID(PID *pid, float setpoint, float measured) {
   float I = pid->ki * pid->integral;
   
   // Derivative term (using error difference, not rate of measurement)
-  // Note: Division by dt is correct - it scales the rate of change
   float D = 0;
   if (dt > 0) {
     D = pid->kd * (error - pid->prevError) / dt;
@@ -118,6 +137,17 @@ float computePID(PID *pid, float setpoint, float measured) {
   pid->prevError = error;
   
   float output = P + I + D;
+  
+  // DEBUG: Print PID components
+  Serial.print("P=");
+  Serial.print(P, 2);
+  Serial.print(" I=");
+  Serial.print(I, 2);
+  Serial.print(" D=");
+  Serial.print(D, 2);
+  Serial.print(" OUT=");
+  Serial.print(output, 2);
+  Serial.print(" | ");
   
   return output;
 }
@@ -229,8 +259,12 @@ void readData(){
 
 // Process joystick input and set target angles/rates
 void processJoystickInput() {
+  // Add deadband to throttle to eliminate noise near minimum
+  uint16_t throttleInput = Data.pot1;
+  if (throttleInput < 20) throttleInput = 0;  // Suppress noise at the bottom
+  
   // Increased throttle range and minimum for ESC response
-  base_motor_speed = map(Data.pot1, 0, 1023, 40, 180);
+  base_motor_speed = map(throttleInput, 0, 1023, 40, 180);
 
   // Map joystick to target angles (±30 degrees for roll/pitch)
   targetRoll = map(Data.joystickL.x, 0, 1023, -30, 30);
@@ -252,17 +286,22 @@ void computePIDCorrections(float &rollCorrection, float &pitchCorrection, float 
   float currentPitch = mpu.getAngleY();  // Y-axis = Pitch
   float currentYawRate = mpu.getGyroZ(); // Z-axis gyro rate for yaw
   
-  // Compute PID corrections
+  // DEBUG: Show what we're computing
+  Serial.print("\n[ROLL PID] ");
   rollCorrection = computePID(&rollPID, targetRoll, currentRoll);
+  
+  Serial.print("\n[PITCH PID] ");
   pitchCorrection = computePID(&pitchPID, targetPitch, currentPitch);
+  
+  Serial.print("\n[YAW PID] ");
   yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
+  
+  Serial.println(); // New line after all PIDs
 
   // Limit corrections to prevent motor saturation
-  // Available headroom = (180 - base_speed) / 2 (split between up and down corrections)
-  // Additional safety margin prevents complete saturation
   float availableHeadroom = (180.0f - base_motor_speed) / 2.0f;
-  float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);  // Cap at 60 for stability
-  float maxYaw = 40.0f;  // Yaw is more aggressive, separate limit
+  float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);
+  float maxYaw = 40.0f;
   
   rollCorrection = constrain(rollCorrection, -maxPitchRoll, maxPitchRoll);
   pitchCorrection = constrain(pitchCorrection, -maxPitchRoll, maxPitchRoll);
@@ -270,19 +309,6 @@ void computePIDCorrections(float &rollCorrection, float &pitchCorrection, float 
 }
 
 // Calculate motor speeds based on corrections
-// X-configuration mixing for quadcopter
-// Motor layout (from above):
-//     FRONT
-//   topL  topR
-//      \ /
-//       X (center)
-//      / \
-// bottomL bottomR
-//     BACK
-//
-// Pitch: forward/backward leveling - front motors opposite rear motors
-// Roll: left/right leveling - left motors opposite right motors
-// Yaw: rotation - diagonal motors pair together
 void calculateMotorSpeeds(float rollCorrection, float pitchCorrection, float yawCorrection) {
   // Apply corrections to motors (X configuration, MPU flat)
   topL_speed = base_motor_speed + pitchCorrection - rollCorrection - yawCorrection;
@@ -361,6 +387,8 @@ void loop()
   
   if (radio.available())
   {
+    Serial.print("RX! "); // Confirm we're receiving data
+    
     readData();
     processJoystickInput();
     printJoystickDebug(now);
@@ -370,6 +398,15 @@ void loop()
     {
       float rollCorrection, pitchCorrection, yawCorrection;
       computePIDCorrections(rollCorrection, pitchCorrection, yawCorrection);
+      
+      // Show final corrections after constraining
+      Serial.print("Final Corrections - R:");
+      Serial.print(rollCorrection, 2);
+      Serial.print(" P:");
+      Serial.print(pitchCorrection, 2);
+      Serial.print(" Y:");
+      Serial.println(yawCorrection, 2);
+      
       calculateMotorSpeeds(rollCorrection, pitchCorrection, yawCorrection);
     }
     else
