@@ -8,414 +8,217 @@
 #define CE_PIN 4
 #define CSN_PIN 5
 
-RF24 radio(CE_PIN, CSN_PIN); 
+#define MISO_PIN 19
+#define MOSI_PIN 23
+#define SCK_PIN 18
+
+RF24 radio(CE_PIN, CSN_PIN);
 const byte address[6] = "NODE1";
 
-// PWM config for motors
-#define TOPL_PIN 14
-#define TOPR_PIN 27
-#define BOTTOML_PIN 26
-#define BOTTOMR_PIN 25
-
-#define TOPL_CHANNEL 0
-#define TOPR_CHANNEL 1
-#define BOTTOML_CHANNEL 2
-#define BOTTOMR_CHANNEL 3
-
-#define PWM_FREQ 50       // 50Hz for ESC
-#define PWM_RESOLUTION 16 // 16-bit resolution
-
-
-//Init MPU6050
-MPU6050 mpu(Wire);
-
-
-
-//Data structure for joysticks
-#pragma pack(push,1)
-struct joystickValues
-{
-  uint16_t x;
-  uint16_t y;
-  bool button;
-};
-#pragma pack(pop)
-
-//Data structure for incomming radio communication (max 32 bytes)
-#pragma pack(push,1)
+#pragma pack(push, 1)
 struct message
 {
-  uint16_t pot1;
-  joystickValues joystickL;
-  joystickValues joystickR;
-  uint8_t PidAxis; // 0 = pitch, 1 = roll, 2 = yaw
+  uint16_t leftX;
+  uint16_t leftY;
+  bool leftButton;
+
+  uint16_t rightX;
+  uint16_t rightY;
+  bool rightButton;
+
+  uint16_t throttle;
+
+  uint8_t pidAxis;
   float kp, ki, kd;
+
+  uint8_t flags;
+  uint8_t checksum;
 };
 #pragma pack(pop)
-// Received data
-message Data;
 
+// GLOBAL VARIABLES
+message rxData;
+uint16_t txBattery;
+int lastPrintTime = 201;
+char space = ' ';
 
-
-// PID structure
-struct PID {
-  float kp, ki, kd;
-  float prevError;
-  float integral;
-  float integralLimit;
-  unsigned long lastTime;
-};
-
-// PID controllers for roll, pitch (angle mode), yaw (rate mode)
-// Integral limits are conservative to prevent windup in small control ranges (0-180 speed)
-PID rollPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
-PID pitchPID = {1.5, 0.08, 0.9, 0, 0, 20.0f, 0};
-PID yawPID = {1.5, 0.01, 0.05, 0, 0, 15.0f, 0}; // Rate mode gains
-
-// Target angles/rates from joystick
-float targetRoll = 0;
-float targetPitch = 0;
-float targetYawRate = 0; // Changed to rate instead of angle
-
-int base_motor_speed;
-uint16_t power = 69;
-
-int topL_speed;
-int topR_speed;
-int bottomL_speed;
-int bottomR_speed;
-
-unsigned long lastPrint = 0;
-
-// PID computation function
-// Uses standard PID control with proper time handling and derivative filtering
-float computePID(PID *pid, float setpoint, float measured) {
-  unsigned long now = micros();
-  float dt = (now - pid->lastTime) / 1000000.0; // Convert to seconds
-  
-  // DEBUG: Print time delta
-  Serial.print("[dt=");
-  Serial.print(dt, 6);
-  Serial.print("] ");
-  
-  pid->lastTime = now;
-  
-  // Modified safety check - only reject very large dt (first call or timeout)
-  if (dt > 1.0f) {
-    Serial.print("RESET_LARGE_DT! ");
-    pid->prevError = 0;
-    pid->integral = 0;
-    return 0;
-  }
-  
-  // Skip if dt is too small (consecutive calls)
-  if (dt <= 0.0f) {
-    Serial.print("SKIP_ZERO_DT! ");
-    return 0;
-  }
-  
-  float error = setpoint - measured;
-  
-  // DEBUG: Print error
-  Serial.print("err=");
-  Serial.print(error, 2);
-  Serial.print(" ");
-  
-  // Proportional term
-  float P = pid->kp * error;
-  
-  // Integral term with anti-windup
-  pid->integral += error * dt;
-  pid->integral = constrain(pid->integral, -pid->integralLimit, pid->integralLimit);
-  float I = pid->ki * pid->integral;
-  
-  // Derivative term (using error difference, not rate of measurement)
-  float D = 0;
-  if (dt > 0) {
-    D = pid->kd * (error - pid->prevError) / dt;
-  }
-  pid->prevError = error;
-  
-  float output = P + I + D;
-  
-  // DEBUG: Print PID components
-  Serial.print("P=");
-  Serial.print(P, 2);
-  Serial.print(" I=");
-  Serial.print(I, 2);
-  Serial.print(" D=");
-  Serial.print(D, 2);
-  Serial.print(" OUT=");
-  Serial.print(output, 2);
-  Serial.print(" | ");
-  
-  return output;
-}
-
-// Reset PID controller - clears integral windup and derivative history
-void resetPID(PID *pid) {
-  pid->integral = 0;      // Clear accumulated integral error
-  pid->prevError = 0;     // Clear previous error for derivative calculation
-  pid->lastTime = micros(); // Initialize timing baseline
-}
-
-void setup()
+// Communication stats
+struct CommStats
 {
-  Serial.begin(115200);
-  Wire.begin();
+  uint32_t packetsReceived = 0;
+  uint32_t checksumErrors = 0;
+  unsigned long lastReceived = 0;
+  unsigned long maxGap = 0;
+} commStats;
 
-  // Initialize MPU6050
-  // NOTE: MPU6050 is mounted FLAT (chip and LED facing UP)
-  // X-axis = Roll, Y-axis = Pitch, Z-axis = Yaw
-  byte status = mpu.begin();
-  Serial.print("MPU6050 status: ");
-  Serial.println(status);
-  
-  if (status != 0) {
-    Serial.println("MPU6050 connection failed!");
-    while (1);
-  }
-  
-  Serial.println("Calibrating gyro... Keep drone FLAT and STILL!");
-  delay(1000);
-  mpu.calcOffsets();
-  Serial.println("Calibration complete!"); 
-  
-  Serial.println("\nInitializing SPI bus (VSPI)...");
-  SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
-  delay(100);
-  
-  // Force CSN high before radio.begin()
-  digitalWrite(5, HIGH);
-  delay(10);
+bool initRadio()
+{
 
   if (!radio.begin(&SPI, CE_PIN, CSN_PIN))
   {
-    Serial.println("NRF24L01 not responding");
-    while (1);
+    return false;
   }
 
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_1MBPS);
   radio.setChannel(108);
-  delay(100);
+  radio.setAutoAck(true);
+  radio.setRetries(3, 5);
   radio.openReadingPipe(1, address);
-  radio.enableAckPayload();
   radio.startListening();
 
-  // Setup PWM for all ESCs
-  ledcSetup(TOPL_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(TOPL_PIN, TOPL_CHANNEL);
-  ledcSetup(TOPR_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(TOPR_PIN, TOPR_CHANNEL);
-  ledcSetup(BOTTOML_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(BOTTOML_PIN, BOTTOML_CHANNEL);
-  ledcSetup(BOTTOMR_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(BOTTOMR_PIN, BOTTOMR_CHANNEL);
-
-  // Arm all ESCs
-  int armDuty = map(1000, 1000, 2000, 3276, 6553);
-  ledcWrite(TOPL_CHANNEL, armDuty);
-  ledcWrite(TOPR_CHANNEL, armDuty);
-  ledcWrite(BOTTOML_CHANNEL, armDuty);
-  ledcWrite(BOTTOMR_CHANNEL, armDuty);
-  Serial.println("Sending arming signal to ESCs...");
-  delay(3000);
-  Serial.println("ESCs armed.");
-
-  // Initialize PID timers
-  resetPID(&rollPID);
-  resetPID(&pitchPID);
-  resetPID(&yawPID);
-
-  while (!radio.available()) {
-    // Wait for radio
-  }
+  return true;
 }
 
-// Read incoming data and update PID gains if needed
-void readData(){
-  radio.read(&Data, sizeof(Data));
-  if(Data.PidAxis < 3){
-    switch(Data.PidAxis){
-      case 0:
-        pitchPID.kp = Data.kp;
-        pitchPID.ki = Data.ki;
-        pitchPID.kd = Data.kd;
-        break;
-      case 1:
-        rollPID.kp = Data.kp;
-        rollPID.ki = Data.ki;
-        rollPID.kd = Data.kd;
-        break;
-      case 2:
-        yawPID.kp = Data.kp;
-        yawPID.ki = Data.ki;
-        yawPID.kd = Data.kd;
-        break;
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+
+  Serial.println("Initing SPI");
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, CSN_PIN);
+  delay(100);
+  pinMode(CSN_PIN, OUTPUT);
+  digitalWrite(CSN_PIN, HIGH);
+  delay(10);
+
+  if (!initRadio())
+  {
+    Serial.println("Radio failed to init");
+    while (1)
+    {
+      delay(1000);
     }
   }
 }
 
-// Process joystick input and set target angles/rates
-void processJoystickInput() {
-  // Add deadband to throttle to eliminate noise near minimum
-  uint16_t throttleInput = Data.pot1;
-  if (throttleInput < 20) throttleInput = 0;  // Suppress noise at the bottom
-  
-  // Increased throttle range and minimum for ESC response
-  base_motor_speed = map(throttleInput, 0, 1023, 40, 180);
+uint8_t calculateChecksum(const message *msg)
+{
+  uint8_t sum = 0;
+  const uint8_t *data = (const uint8_t *)msg;
 
-  // Map joystick to target angles (±30 degrees for roll/pitch)
-  targetRoll = map(Data.joystickL.x, 0, 1023, -30, 30);
-  targetPitch = map(Data.joystickL.y, 0, 1023, -30, 30);
-  
-  // Apply deadband to prevent drift
-  if (abs(targetRoll) < 3.0) targetRoll = 0;
-  if (abs(targetPitch) < 3.0) targetPitch = 0;
-  
-  // Use right joystick for yaw RATE (degrees per second)
-  targetYawRate = map(Data.joystickR.x, 0, 1023, -150, 150);
-  if (abs(targetYawRate) < 10) targetYawRate = 0; // Deadband for yaw
+  for (size_t i = 0; i < sizeof(message) - 1; i++)
+  {
+    sum += data[i];
+  }
+  return sum;
 }
 
-// Compute all PID corrections based on current sensor data
-void computePIDCorrections(float &rollCorrection, float &pitchCorrection, float &yawCorrection) {
-  // Get current angles and rates from MPU6050 (mounted flat)
-  float currentRoll = mpu.getAngleX();   // X-axis = Roll
-  float currentPitch = mpu.getAngleY();  // Y-axis = Pitch
-  float currentYawRate = mpu.getGyroZ(); // Z-axis gyro rate for yaw
-  
-  // DEBUG: Show what we're computing
-  Serial.print("\n[ROLL PID] ");
-  rollCorrection = computePID(&rollPID, targetRoll, currentRoll);
-  
-  Serial.print("\n[PITCH PID] ");
-  pitchCorrection = computePID(&pitchPID, targetPitch, currentPitch);
-  
-  Serial.print("\n[YAW PID] ");
-  yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
-  
-  Serial.println(); // New line after all PIDs
+bool validateChecksum(const message *msg)
+{
 
-  // Limit corrections to prevent motor saturation
-  float availableHeadroom = (180.0f - base_motor_speed) / 2.0f;
-  float maxPitchRoll = constrain(availableHeadroom, 0, 60.0f);
-  float maxYaw = 40.0f;
-  
-  rollCorrection = constrain(rollCorrection, -maxPitchRoll, maxPitchRoll);
-  pitchCorrection = constrain(pitchCorrection, -maxPitchRoll, maxPitchRoll);
-  yawCorrection = constrain(yawCorrection, -maxYaw, maxYaw);
+  uint8_t calculated = calculateChecksum(msg);
+  return (calculated == msg->checksum);
 }
 
-// Calculate motor speeds based on corrections
-void calculateMotorSpeeds(float rollCorrection, float pitchCorrection, float yawCorrection) {
-  // Apply corrections to motors (X configuration, MPU flat)
-  topL_speed = base_motor_speed + pitchCorrection - rollCorrection - yawCorrection;
-  topR_speed = base_motor_speed + pitchCorrection + rollCorrection + yawCorrection;
-  bottomL_speed = base_motor_speed - pitchCorrection - rollCorrection + yawCorrection;
-  bottomR_speed = base_motor_speed - pitchCorrection + rollCorrection - yawCorrection;
+bool recieveData()
+{
 
-  // Constrain motor speeds to valid range (0-180 maps to PWM 3276-6553)
-  topL_speed = constrain(topL_speed, 0, 180);
-  topR_speed = constrain(topR_speed, 0, 180);
-  bottomL_speed = constrain(bottomL_speed, 0, 180);
-  bottomR_speed = constrain(bottomR_speed, 0, 180);
+  radio.read(&rxData, sizeof(rxData));
+
+  if (!validateChecksum(&rxData))
+  {
+    commStats.checksumErrors++;
+    return false;
+  }
+
+  radio.writeAckPayload(1, &txBattery, sizeof(txBattery));
+  return true;
 }
 
-// Reset all motor speeds and PID controllers
-void disarmMotors() {
-  topL_speed = 0;
-  topR_speed = 0;
-  bottomL_speed = 0;
-  bottomR_speed = 0;
-  
-  resetPID(&rollPID);
-  resetPID(&pitchPID);
-  resetPID(&yawPID);
-}
+void updateCommStats(bool recieved)
+{
+  if (recieved)
+  {
+    unsigned long now = millis();
 
-// Write calculated speeds to all ESCs
-void writeMotorSpeeds() {
-  ledcWrite(TOPL_CHANNEL, map(topL_speed, 0, 180, 3276, 6553));
-  ledcWrite(TOPR_CHANNEL, map(topR_speed, 0, 180, 3276, 6553));
-  ledcWrite(BOTTOML_CHANNEL, map(bottomL_speed, 0, 180, 3276, 6553));
-  ledcWrite(BOTTOMR_CHANNEL, map(bottomR_speed, 0, 180, 3276, 6553));
-}
+    if (commStats.packetsReceived > 0)
+    {
+      unsigned long gap = now - commStats.lastReceived;
+      if (gap > commStats.maxGap)
+      {
+        commStats.maxGap = gap;
+      }
+    }
 
-// Print debug information periodically
-void printDebugInfo(unsigned long now) {
-  if (now - lastPrint > 200) {
-    lastPrint = now;
-    
-    // Detailed diagnostics
-    Serial.print("Base: "); Serial.print(base_motor_speed);
-    Serial.print(" | R:"); Serial.print(mpu.getAngleX(), 1);
-    Serial.print(" P:"); Serial.print(mpu.getAngleY(), 1);
-    Serial.print(" YawRate:"); Serial.print(mpu.getGyroZ(), 1);
-    Serial.print(" | tR:"); Serial.print(targetRoll, 1);
-    Serial.print(" tP:"); Serial.print(targetPitch, 1);
-    Serial.print(" tYR:"); Serial.print(targetYawRate, 1);
-    Serial.print(" | Motors: ");
-    Serial.print(topL_speed); Serial.print(",");
-    Serial.print(topR_speed); Serial.print(",");
-    Serial.print(bottomL_speed); Serial.print(",");
-    Serial.println(bottomR_speed);
+    commStats.packetsReceived++;
+    commStats.lastReceived = now;
   }
 }
 
-// Print joystick values for diagnostics
-void printJoystickDebug(unsigned long now) {
-  static unsigned long lastJoyPrint = 0;
-  if (now - lastJoyPrint > 1000) {
-    lastJoyPrint = now;
-    Serial.print("JoyL: "); Serial.print(Data.joystickL.x);
-    Serial.print(","); Serial.print(Data.joystickL.y);
-    Serial.print(" | JoyR: "); Serial.print(Data.joystickR.x);
-    Serial.print(","); Serial.println(Data.joystickR.y);
+void printCommStats()
+{
+  unsigned long timeSinceLastRx = millis() - commStats.lastReceived;
+
+  Serial.println("\n--- Communication Statistics ---");
+  Serial.print("Packets Received: ");
+  Serial.println(commStats.packetsReceived);
+  Serial.print("Checksum Errors: ");
+  Serial.println(commStats.checksumErrors);
+  Serial.print("Max Gap: ");
+  Serial.print(commStats.maxGap);
+  Serial.println("ms");
+  Serial.print("Last received: ");
+  Serial.print(timeSinceLastRx);
+  Serial.println("ms ago");
+
+  if (commStats.packetsReceived > 0)
+  {
+    Serial.println("Status: CONNECTED");
   }
+  else
+  {
+    Serial.println("Status: WAITING...");
+  }
+  Serial.println("--------------------------------\n");
 }
 
-
+void printRecievedData()
+{
+  Serial.print("throttle: ");
+  Serial.println(rxData.throttle);
+  Serial.print("leftX: ");
+  Serial.println(rxData.leftX);
+  Serial.print("leftY: ");
+  Serial.println(rxData.leftY);
+  Serial.print("leftButton: ");
+  Serial.println(rxData.leftButton);
+  Serial.print("rightX: ");
+  Serial.println(rxData.rightX);
+  Serial.print("rightY: ");
+  Serial.println(rxData.rightY);
+  Serial.print("rightButton: ");
+  Serial.println(rxData.rightButton);
+  Serial.print("Pid axis: ");
+  Serial.println(rxData.pidAxis);
+  Serial.print("Ki, Kp, Kd: ");
+  Serial.println(rxData.ki + space + rxData.kp + space + rxData.kd);
+}
 
 void loop()
 {
-  unsigned long now = millis();
-  
-  // Update MPU6050 data
-  mpu.update();
-  
+
   if (radio.available())
   {
-    Serial.print("RX! "); // Confirm we're receiving data
-    
-    readData();
-    processJoystickInput();
-    printJoystickDebug(now);
+    bool success = recieveData();
+    updateCommStats(success);
 
-    // Only apply PID when throttle is above minimum
-    if (base_motor_speed > 40)
+    unsigned long now = millis();
+    unsigned long timeSinceLastRx = now - commStats.lastReceived;
+
+    if (commStats.packetsReceived > 0 && timeSinceLastRx > 200)
     {
-      float rollCorrection, pitchCorrection, yawCorrection;
-      computePIDCorrections(rollCorrection, pitchCorrection, yawCorrection);
-      
-      // Show final corrections after constraining
-      Serial.print("Final Corrections - R:");
-      Serial.print(rollCorrection, 2);
-      Serial.print(" P:");
-      Serial.print(pitchCorrection, 2);
-      Serial.print(" Y:");
-      Serial.println(yawCorrection, 2);
-      
-      calculateMotorSpeeds(rollCorrection, pitchCorrection, yawCorrection);
-    }
-    else
-    {
-      disarmMotors();
+      // No data for 200ms
+      // Add motor failsafe here
     }
 
-    writeMotorSpeeds();
-    printDebugInfo(now);
-    radio.writeAckPayload(1, &power, sizeof(power));
+    if (success)
+    {
+      if (now - lastPrintTime >= 200)
+      {
+        lastPrintTime = now;
+        printRecievedData();
+      }
+    }
   }
 }
