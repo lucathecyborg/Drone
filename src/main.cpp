@@ -3,6 +3,9 @@
 
 #include "Communication.h"
 #include "IMU.h"
+#include "BMP.h"
+
+BMP bmp;
 
 void setup()
 {
@@ -27,7 +30,16 @@ void setup()
 
   if (!initICM())
   {
-    Serial.println("IMU not found, aborting.");
+    Serial.println("IMU failed to init, aborting.");
+    while (1)
+    {
+      delay(100);
+    }
+  }
+
+  if (!bmp.initBMP())
+  {
+    Serial.println("BMP failed to init, aborting.");
     while (1)
     {
       delay(100);
