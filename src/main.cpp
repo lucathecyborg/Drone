@@ -4,8 +4,7 @@
 #include "Communication.h"
 #include "IMU.h"
 #include "BMP.h"
-
-BMP bmp;
+#include "ADS1115.h"
 
 void setup()
 {
@@ -40,6 +39,14 @@ void setup()
   if (!bmp.initBMP())
   {
     Serial.println("BMP failed to init, aborting.");
+    while (1)
+    {
+      delay(100);
+    }
+  }
+  if (!ads.initADS())
+  {
+    Serial.println("ADS failed to init, aborting.");
     while (1)
     {
       delay(100);

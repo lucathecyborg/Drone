@@ -20,3 +20,5 @@ public:
     void calibrateAltitude();
     float getRelativeAltitude();
 };
+
+BMP bmp;
