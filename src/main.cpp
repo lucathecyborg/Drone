@@ -43,6 +43,17 @@
 #define ESC_MIN_US 1000
 #define ESC_MAX_US 2000
 
+// flags
+#define FLAG_ARMED (1 << 0)          // bit 0: motors armed
+#define FLAG_ALT_HOLD (1 << 1)       // bit 1: altitude hold enabled
+#define FLAG_RETURN_TO_HOME (1 << 2) // enable return to home
+#define FLAG_SAFE_LANDING (1 << 3)   // enable safe landing
+#define FLAG_SET_HOME (1 << 4)       // set GPS home location
+#define FLAG_FREEZE (1 << 5)         // freeze input from controller
+
+bool holding_altitude = false;
+int held_power = 0;
+
 // 16-bit PWM duty cycle values for 50Hz (20ms period)
 // duty = (pulse_us / 20000) * 65535
 #define ESC_MIN_DUTY 3277 // 1000us / 20000 * 65535
@@ -447,6 +458,7 @@ void mixMotors(int throttle, float roll, float pitch, float yaw)
  */
 void processInputs()
 {
+
   // Map throttle from controller (0-1023) to motor scale (0-1000)
   // Apply deadband at low end to eliminate noise
   uint16_t rawThrottle = rxData.throttle;
@@ -454,6 +466,12 @@ void processInputs()
   {
     rawThrottle = 0;
   }
+
+  if (holding_altitude)
+  {
+    rawThrottle = held_power;
+  }
+
   baseThrottle = map(rawThrottle, 0, 1023, 0, MOTOR_MAX);
 
 // Map left joystick to roll/pitch angles
@@ -670,8 +688,22 @@ void setup()
   }
   Serial.println("IMU filter converged.");
 
-  // Arm ESCs
-  armMotors();
+  bool arming = false;
+  while (arming)
+  {
+    if (radio.available())
+    {
+      bool success = recieveData();
+      if (success)
+      {
+        if (rxData.flags & FLAG_ARMED)
+        {
+          armMotors();
+          arming = true;
+        }
+      }
+    }
+  }
 
   // Initialize control timing
   lastControlTime = micros();
@@ -694,14 +726,49 @@ void loop()
     {
       lastRxTime = now;
 
-      // Process inputs from controller
-      processInputs();
+      // If throttle drops below 20, disarm and require re-arming
+      if (rxData.throttle < 20)
+      {
+        armed = false; // Enter locked state
+      }
 
-      // Update PID gains if controller sent new values
-      updatePIDGains();
+      // Only allow operation if armed flag is received AND we're armed
+      if (!armed && (rxData.flags & FLAG_ARMED))
+      {
+        armed = true; // Re-arm when flag is set
+        Serial.println("Motors re-armed");
+      }
 
-      // Update communication stats
-      updateCommStats(success);
+      // Handle altitude hold flag
+      if (rxData.flags & FLAG_ALT_HOLD)
+      {
+        if (!holding_altitude)
+        {
+          held_power = rxData.throttle;
+          holding_altitude = true;
+          Serial.printf("Altitude hold engaged at throttle: %d\n", held_power);
+        }
+      }
+      else
+      {
+        holding_altitude = false;
+      }
+
+      if (armed)
+      {
+        // Process inputs from controller
+        processInputs();
+
+        // Update PID gains if controller sent new values
+        updatePIDGains();
+
+        // Update communication stats
+        updateCommStats(success);
+      }
+      else
+      {
+        Serial.println("Motors need to be rearmed");
+      }
     }
   }
 
