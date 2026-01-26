@@ -53,7 +53,7 @@ int initMotors()
   ledcAttachPin(BOTTOMR_PIN, BOTTOMR_CHANNEL);
 
   Serial.println("All motor channels initialized");
-  return 0;
+  return 1;
 }
 
 void armMotors()
@@ -107,11 +107,13 @@ void setup()
     Serial.println("BMP failed to init, aborting.");
     infiniteLoop();
   }
+
   if (!ads.initADS())
   {
     Serial.println("ADS failed to init, aborting.");
     infiniteLoop();
   }
+
   if (initMotors())
   {
     armMotors();
