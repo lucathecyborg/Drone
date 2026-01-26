@@ -21,8 +21,8 @@ bool initICM()
     icm.setGyroRange(ICM20948_GYRO_RANGE_2000_DPS); // ±2000°/s for aggressive flying
 
     // Configure sample rates
-    icm.setAccelRateDivisor(4095); // Max rate (uint16_t max)
-    icm.setGyroRateDivisor(255);   // Max rate (uint8_t max)
+    icm.setAccelRateDivisor(3);
+    icm.setGyroRateDivisor(3);
     icm.setMagDataRate(AK09916_MAG_DATARATE_100_HZ);
 
     // Initialize Mahony filter (250 Hz update rate)
