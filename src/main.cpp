@@ -51,8 +51,8 @@
 #define FLAG_SET_HOME (1 << 4)       // set GPS home location
 #define FLAG_FREEZE (1 << 5)         // freeze input from controller
 
-bool holding_altitude = false;
-int held_power = 0;
+bool holdingAltitude = false;
+int heldPower = 0;
 
 // 16-bit PWM duty cycle values for 50Hz (20ms period)
 // duty = (pulse_us / 20000) * 65535
@@ -157,6 +157,52 @@ bool armed = false;
 unsigned long lastRxTime = 0;
 #define FAILSAFE_TIMEOUT_MS 500
 
+// Heading hold
+float targetHeading = 0;
+bool headingHoldActive = false;
+
+// ============================================================================
+// MAGNETOMETER HEADING (inverted due to board layout)
+// ============================================================================
+
+/**
+ * Get the corrected heading from the IMU magnetometer.
+ * The magnetometer is mounted inverted on the board, so raw 0° = 180° real
+ * and raw 180° = 0° real. This corrects that by adding 180° and wrapping.
+ *
+ * @return Corrected heading in degrees (0-360, 0=North, 90=East)
+ */
+float getCorrectedHeading()
+{
+  float rawYaw = getYaw(); // From Mahony filter (0-360)
+
+  // Invert: add 180 and wrap to 0-360
+  float corrected = rawYaw + 180.0f;
+  if (corrected >= 360.0f)
+  {
+    corrected -= 360.0f;
+  }
+
+  return corrected;
+}
+
+/**
+ * Calculate the shortest angular difference between two headings.
+ * Returns value in range -180 to +180.
+ * Positive = target is clockwise from current.
+ */
+float headingError(float target, float current)
+{
+  float error = target - current;
+
+  if (error > 180.0f)
+    error -= 360.0f;
+  if (error < -180.0f)
+    error += 360.0f;
+
+  return error;
+}
+
 // ============================================================================
 // PID COMPUTATION
 // ============================================================================
@@ -213,15 +259,12 @@ float computePID(PIDController *pid, float setpoint, float measured)
   float error = setpoint - measured;
 
   // ---- PROPORTIONAL TERM ----
-  // P = Kp * error
   float P = pid->kp * error;
 
   // ---- INTEGRAL TERM ----
-  // Accumulate error over time: I += Ki * error * dt
-  // With anti-windup clamping
   pid->integral += error * dt;
 
-  // Anti-windup: Clamp integral to prevent excessive accumulation
+  // Anti-windup: Clamp integral
   if (pid->integral > pid->integralLimit)
   {
     pid->integral = pid->integralLimit;
@@ -234,15 +277,9 @@ float computePID(PIDController *pid, float setpoint, float measured)
   float I = pid->ki * pid->integral;
 
   // ---- DERIVATIVE TERM ----
-  // Using derivative-on-measurement to prevent derivative kick
-  // D = -Kd * d(measurement)/dt
-  // Negative because we want to oppose changes in measurement
+  // Derivative-on-measurement to prevent derivative kick
   float dMeasurement = (measured - pid->prevMeasurement) / dt;
   float D = -pid->kd * dMeasurement;
-
-  // Alternative: derivative-on-error (causes kick on setpoint change)
-  // float dError = (error - pid->prevError) / dt;
-  // float D = pid->kd * dError;
 
   // Store state for next iteration
   pid->prevTime = now;
@@ -252,7 +289,7 @@ float computePID(PIDController *pid, float setpoint, float measured)
   // Calculate total output
   float output = P + I + D;
 
-  // Clamp output to limits
+  // Clamp output
   if (output > pid->outputLimit)
   {
     output = pid->outputLimit;
@@ -384,52 +421,24 @@ void stopMotors()
 /**
  * Apply motor mixing for X-configuration quadcopter.
  *
- * Motor layout and rotation directions:
- *       FRONT
- *    TL(CCW)  TR(CW)
- *         \/
- *         /\
- *    BL(CW)   BR(CCW)
- *       BACK
- *
  * Mixing equations:
  * - Throttle: All motors increase equally
  * - Roll (right = positive): Left motors increase, right motors decrease
  * - Pitch (forward = positive): Back motors increase, front motors decrease
  * - Yaw (CW = positive): CCW motors increase, CW motors decrease
- *
- * @param throttle  Base throttle (0-1000)
- * @param roll      Roll correction from PID
- * @param pitch     Pitch correction from PID
- * @param yaw       Yaw correction from PID
  */
 void mixMotors(int throttle, float roll, float pitch, float yaw)
 {
-  // Motor mixing equations for X configuration
-  // Signs determined by motor positions and rotation directions
-
-  // Top Left (front-left, CCW rotation)
-  // - Positive pitch (nose up): decrease front motors
-  // - Positive roll (right): increase left motors
-  // - Positive yaw (CW): increase CCW motors
+  // Top Left (front-left, CCW): -pitch +roll +yaw
   motorTL = throttle - pitch + roll + yaw;
 
-  // Top Right (front-right, CW rotation)
-  // - Positive pitch (nose up): decrease front motors
-  // - Positive roll (right): decrease right motors
-  // - Positive yaw (CW): decrease CW motors
+  // Top Right (front-right, CW): -pitch -roll -yaw
   motorTR = throttle - pitch - roll - yaw;
 
-  // Bottom Left (back-left, CW rotation)
-  // - Positive pitch (nose up): increase back motors
-  // - Positive roll (right): increase left motors
-  // - Positive yaw (CW): decrease CW motors
+  // Bottom Left (back-left, CW): +pitch +roll -yaw
   motorBL = throttle + pitch + roll - yaw;
 
-  // Bottom Right (back-right, CCW rotation)
-  // - Positive pitch (nose up): increase back motors
-  // - Positive roll (right): decrease right motors
-  // - Positive yaw (CW): increase CCW motors
+  // Bottom Right (back-right, CCW): +pitch -roll +yaw
   motorBR = throttle + pitch - roll + yaw;
 
   // Constrain all motors to valid range
@@ -443,6 +452,12 @@ void mixMotors(int throttle, float roll, float pitch, float yaw)
 // INPUT PROCESSING
 // ============================================================================
 
+#define MAX_ANGLE 30.0f
+#define JOYSTICK_CENTER 512
+#define JOYSTICK_DEADBAND 30
+#define MAX_YAW_RATE 180.0f
+#define YAW_DEADBAND 50
+
 /**
  * Process joystick inputs and convert to control setpoints.
  *
@@ -455,34 +470,27 @@ void mixMotors(int throttle, float roll, float pitch, float yaw)
  *
  * Throttle:
  * - Potentiometer: Base motor speed
+ *
+ * When the yaw stick is centered, heading hold engages automatically
+ * using the magnetometer to prevent gyro drift.
  */
 void processInputs()
 {
-
-  // Map throttle from controller (0-1023) to motor scale (0-1000)
-  // Apply deadband at low end to eliminate noise
+  // ---- THROTTLE ----
   uint16_t rawThrottle = rxData.throttle;
   if (rawThrottle < 20)
   {
     rawThrottle = 0;
   }
 
-  if (holding_altitude)
+  if (holdingAltitude)
   {
-    rawThrottle = held_power;
+    rawThrottle = heldPower;
   }
 
   baseThrottle = map(rawThrottle, 0, 1023, 0, MOTOR_MAX);
 
-// Map left joystick to roll/pitch angles
-// Joystick center is ~512, range 0-1023
-// Map to ±30 degrees (adjustable)
-#define MAX_ANGLE 30.0f
-#define JOYSTICK_CENTER 512
-#define JOYSTICK_DEADBAND 30
-
-  // Roll: Left joystick X axis
-  // Positive X = stick right = roll right
+  // ---- ROLL ----
   int rollInput = rxData.leftX - JOYSTICK_CENTER;
   if (abs(rollInput) < JOYSTICK_DEADBAND)
   {
@@ -493,8 +501,7 @@ void processInputs()
     targetRoll = map(rxData.leftX, 0, 1023, -MAX_ANGLE, MAX_ANGLE);
   }
 
-  // Pitch: Left joystick Y axis
-  // Positive Y = stick forward = pitch forward
+  // ---- PITCH ----
   int pitchInput = rxData.leftY - JOYSTICK_CENTER;
   if (abs(pitchInput) < JOYSTICK_DEADBAND)
   {
@@ -505,18 +512,27 @@ void processInputs()
     targetPitch = map(rxData.leftY, 0, 1023, -MAX_ANGLE, MAX_ANGLE);
   }
 
-// Yaw rate: Right joystick X axis
-// Map to ±180 degrees per second
-#define MAX_YAW_RATE 180.0f
-#define YAW_DEADBAND 50
-
+  // ---- YAW (with heading hold) ----
   int yawInput = rxData.rightX - JOYSTICK_CENTER;
   if (abs(yawInput) < YAW_DEADBAND)
   {
-    targetYawRate = 0;
+    // Stick centered: engage heading hold
+    if (!headingHoldActive)
+    {
+      // Lock the current heading as the target
+      targetHeading = getCorrectedHeading();
+      headingHoldActive = true;
+    }
+
+    // Compute yaw rate from heading error to maintain heading
+    float hError = headingError(targetHeading, getCorrectedHeading());
+    targetYawRate = hError * 2.0f; // P-gain for heading hold
+    targetYawRate = constrain(targetYawRate, -MAX_YAW_RATE, MAX_YAW_RATE);
   }
   else
   {
+    // Stick deflected: manual yaw rate mode
+    headingHoldActive = false;
     targetYawRate = map(rxData.rightX, 0, 1023, -MAX_YAW_RATE, MAX_YAW_RATE);
   }
 }
@@ -570,7 +586,7 @@ void updatePIDGains()
  */
 void controlLoop()
 {
-  // Get current attitude from IMU (using your IMU.h functions)
+  // Get current attitude from IMU (using IMU.h functions)
   float currentRollAngle = getRoll();    // Mahony filter output (degrees)
   float currentPitchAngle = getPitch();  // Mahony filter output (degrees)
   float currentYawRate = getGyroRateZ(); // Raw gyro Z for yaw rate mode (deg/s)
@@ -581,6 +597,7 @@ void controlLoop()
     // Throttle too low - disarm/idle state
     stopMotors();
     resetAllPIDs();
+    headingHoldActive = false;
     return;
   }
 
@@ -613,9 +630,9 @@ void failsafe()
 
 void printDebug()
 {
-  Serial.printf("Thr:%4d | R:%6.1f P:%6.1f YR:%6.1f | tR:%5.1f tP:%5.1f tYR:%5.1f | M: %4d %4d %4d %4d\n",
+  Serial.printf("Thr:%4d | R:%6.1f P:%6.1f H:%5.1f | tR:%5.1f tP:%5.1f tYR:%5.1f | M: %4d %4d %4d %4d\n",
                 baseThrottle,
-                getRoll(), getPitch(), getGyroRateZ(),
+                getRoll(), getPitch(), getCorrectedHeading(),
                 targetRoll, targetPitch, targetYawRate,
                 motorTL, motorTR, motorBL, motorBR);
 }
@@ -688,26 +705,26 @@ void setup()
   }
   Serial.println("IMU filter converged.");
 
-  bool arming = false;
-  while (arming)
+  // Wait for ARM command from controller
+  Serial.println("Waiting for ARM command...");
+  while (true)
   {
     if (radio.available())
     {
       bool success = recieveData();
-      if (success)
+      if (success && (rxData.flags & FLAG_ARMED))
       {
-        if (rxData.flags & FLAG_ARMED)
-        {
-          armMotors();
-          arming = true;
-        }
+        armMotors();
+        break;
       }
     }
+    delay(10);
   }
 
   // Initialize control timing
   lastControlTime = micros();
   lastRxTime = millis();
+  targetHeading = getCorrectedHeading(); // Initialize heading hold
 
   Serial.println("Ready for flight!");
 }
@@ -729,29 +746,32 @@ void loop()
       // If throttle drops below 20, disarm and require re-arming
       if (rxData.throttle < 20)
       {
-        armed = false; // Enter locked state
+        armed = false;
       }
 
       // Only allow operation if armed flag is received AND we're armed
       if (!armed && (rxData.flags & FLAG_ARMED))
       {
-        armed = true; // Re-arm when flag is set
+        armed = true;
+        resetAllPIDs();
+        headingHoldActive = false;
+        targetHeading = getCorrectedHeading();
         Serial.println("Motors re-armed");
       }
 
       // Handle altitude hold flag
       if (rxData.flags & FLAG_ALT_HOLD)
       {
-        if (!holding_altitude)
+        if (!holdingAltitude)
         {
-          held_power = rxData.throttle;
-          holding_altitude = true;
-          Serial.printf("Altitude hold engaged at throttle: %d\n", held_power);
+          heldPower = rxData.throttle;
+          holdingAltitude = true;
+          Serial.printf("Altitude hold engaged at throttle: %d\n", heldPower);
         }
       }
       else
       {
-        holding_altitude = false;
+        holdingAltitude = false;
       }
 
       if (armed)
@@ -786,7 +806,7 @@ void loop()
     lastControlTime = nowMicros;
 
     // Update IMU data
-    updateIMU(); // Assumes IMU.h provides this
+    updateIMU();
 
     // Run control loop
     if (armed)

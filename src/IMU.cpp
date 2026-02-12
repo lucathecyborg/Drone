@@ -1,89 +1,89 @@
+#include <Arduino.h>
+#include <Wire.h>
 #include "IMU.h"
 
-// Define global variables declared in IMU.h
+// Global variables declared in IMU.h
 float currentRoll = 0;
 float currentPitch = 0;
 float currentYaw = 0;
 float gyroRateX = 0;
 float gyroRateY = 0;
 float gyroRateZ = 0;
-Adafruit_ICM20948 icm;
+ICM_20948_I2C imu;
 Adafruit_Mahony filter;
 
 bool initICM()
 {
-    if (!icm.begin_I2C())
+    imu.begin(Wire, AD0_VAL);
+
+    if (imu.status != ICM_20948_Stat_Ok)
     {
+        Serial.print("ICM-20948 init failed: ");
+        Serial.println(imu.statusString());
         return false;
     }
 
-    icm.setAccelRange(ICM20948_ACCEL_RANGE_8_G);    // ±8g is good for drones
-    icm.setGyroRange(ICM20948_GYRO_RANGE_2000_DPS); // ±2000°/s for aggressive flying
+    // Configure full scale ranges
+    ICM_20948_fss_t fss;
+    fss.a = gpm8;    // ±8g — good for drones
+    fss.g = dps2000; // ±2000°/s — for aggressive flying
+    imu.setFullScale(ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr, fss);
 
-    // Configure sample rates
-    icm.setAccelRateDivisor(3);
-    icm.setGyroRateDivisor(3);
-    icm.setMagDataRate(AK09916_MAG_DATARATE_100_HZ);
+    // Set sample mode to continuous
+    imu.setSampleMode(ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr, ICM_20948_Sample_Mode_Continuous);
 
-    // Initialize Mahony filter (250 Hz update rate)
+    // Initialize Mahony filter at 250 Hz with tuned gains
     filter.begin(250);
-    Serial.println("IMU and filter initialised");
+    filter.setKp(MAHONY_KP);
+    filter.setKi(MAHONY_KI);
+
+    Serial.println("IMU and filter initialised (SparkFun library)");
+    Serial.printf("  Mahony Kp=%.1f  Ki=%.2f\n", MAHONY_KP, MAHONY_KI);
     return true;
 }
 
 void updateIMU()
 {
+    if (!imu.dataReady())
+    {
+        return; // No new data yet
+    }
 
-    sensors_event_t accel, gyro, mag, temp;
-    icm.getEvent(&accel, &gyro, &mag, &temp);
+    imu.getAGMT(); // Read all sensors: accel, gyro, mag, temp
 
-    // Store raw gyro rates (in deg/s) - useful for rate mode or PID derivative
-    gyroRateX = gyro.gyro.x * 57.2958; // Convert rad/s to deg/s
-    gyroRateY = gyro.gyro.y * 57.2958;
-    gyroRateZ = gyro.gyro.z * 57.2958;
+    // --- Gyro: SparkFun returns deg/s directly ---
+    gyroRateX = imu.gyrX();
+    gyroRateY = imu.gyrY();
+    gyroRateZ = imu.gyrZ();
 
-    // Update Mahony filter with sensor data
+    // --- Accel: SparkFun returns mg, convert to m/s² ---
+    float ax = imu.accX() * 0.001f * 9.81f;
+    float ay = imu.accY() * 0.001f * 9.81f;
+    float az = imu.accZ() * 0.001f * 9.81f;
+
+    // --- Mag: AK09916 axis alignment to ICM-20948 accel/gyro frame ---
+    // The AK09916 has a different axis convention than the accel/gyro.
+    // PX4 uses: (mag.y, mag.x, -mag.z) to align them.
+    float mx = imu.magY();
+    float my = imu.magX();
+    float mz = -imu.magZ();
+
+    // Update Mahony filter
     filter.update(
-        gyroRateX, gyroRateY, gyroRateZ, // Gyro in deg/s
-        accel.acceleration.x,            // Accel in m/s²
-        accel.acceleration.y,
-        accel.acceleration.z,
-        mag.magnetic.x, // Mag in µT
-        mag.magnetic.y,
-        mag.magnetic.z);
+        gyroRateX, gyroRateY, gyroRateZ,
+        ax, ay, az,
+        mx, my, mz);
 
-    // Get calculated orientation angles
-    currentRoll = filter.getRoll();   // degrees
-    currentPitch = filter.getPitch(); // degrees
-    currentYaw = filter.getYaw();     // degrees
+    // Get orientation angles
+    currentRoll = filter.getRoll();
+    currentPitch = filter.getPitch();
+    currentYaw = filter.getYaw();
 }
 
-float getRoll()
-{
-    return currentRoll;
-}
+float getRoll() { return currentRoll; }
+float getPitch() { return currentPitch; }
+float getYaw() { return currentYaw; }
 
-float getPitch()
-{
-    return currentPitch;
-}
-
-float getYaw()
-{
-    return currentYaw;
-}
-
-float getGyroRateX()
-{
-    return gyroRateX;
-}
-
-float getGyroRateY()
-{
-    return gyroRateY;
-}
-
-float getGyroRateZ()
-{
-    return gyroRateZ;
-}
+float getGyroRateX() { return gyroRateX; }
+float getGyroRateY() { return gyroRateY; }
+float getGyroRateZ() { return gyroRateZ; }
