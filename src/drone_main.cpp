@@ -22,8 +22,11 @@
 //    BL   v   BR
 //       BACK
 //
-// CCW motors spin counter-clockwise (produce positive yaw torque)
-// CW motors spin clockwise (produce negative yaw torque)
+// CCW motors spin counter-clockwise (produce CW reaction torque on frame)
+// CW motors spin clockwise (produce CCW reaction torque on frame)
+//
+// To yaw CW (positive): speed up CW motors (TR, BL), slow CCW motors (TL, BR)
+// To yaw CCW (negative): speed up CCW motors (TL, BR), slow CW motors (TR, BL)
 // ============================================================================
 
 #define TOPL_PIN 14
@@ -65,6 +68,19 @@ int heldPower = 0;
 #define MOTOR_IDLE 50 // Minimum spin when armed with throttle
 
 // ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Float version of map() for smooth analog control.
+ * Arduino's map() uses integer math which quantizes small ranges badly.
+ */
+float fmap(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// ============================================================================
 // PID CONTROLLER
 // ============================================================================
 
@@ -90,10 +106,16 @@ struct PIDController
 // PID controllers for each axis
 // Roll/Pitch: angle mode (setpoint is target angle in degrees)
 // Yaw: rate mode (setpoint is target rotation rate in deg/s)
+//
+// Tuning notes for 1.5kg quad:
+//   - Start with ki=0 for first flights, tune P and D first
+//   - D term uses gyro rate directly (not differentiated angle) for less noise
+//   - Increase kp if drone feels sluggish, decrease if it oscillates
+//   - Add ki slowly only after P and D are stable to fix steady-state drift
 PIDController rollPID = {
-    .kp = 1.5f,
-    .ki = 0.08f,
-    .kd = 0.9f,
+    .kp = 3.0f,
+    .ki = 0.0f, // Start at 0, add slowly after P/D are tuned
+    .kd = 0.5f,
     .integral = 0,
     .prevError = 0,
     .prevMeasurement = 0,
@@ -103,9 +125,9 @@ PIDController rollPID = {
     .outputLimit = 400.0f};
 
 PIDController pitchPID = {
-    .kp = 1.5f,
-    .ki = 0.08f,
-    .kd = 0.9f,
+    .kp = 3.0f,
+    .ki = 0.0f, // Start at 0, add slowly after P/D are tuned
+    .kd = 0.5f,
     .integral = 0,
     .prevError = 0,
     .prevMeasurement = 0,
@@ -115,8 +137,8 @@ PIDController pitchPID = {
     .outputLimit = 400.0f};
 
 PIDController yawPID = {
-    .kp = 2.0f,
-    .ki = 0.05f,
+    .kp = 3.0f,
+    .ki = 0.0f,
     .kd = 0.0f, // Usually 0 for yaw rate mode
     .integral = 0,
     .prevError = 0,
@@ -211,7 +233,9 @@ float headingError(float target, float current)
  * Compute PID output using proper discrete-time implementation.
  *
  * Key features:
- * 1. Derivative-on-measurement: Prevents derivative kick when setpoint changes
+ * 1. Derivative uses gyro rate directly (passed as gyroRate parameter)
+ *    instead of differentiating the angle measurement. This is far less
+ *    noisy and is standard practice in flight controllers (Betaflight, etc.)
  * 2. Anti-windup: Clamps integral term to prevent saturation
  * 3. Proper time handling: Uses actual elapsed time for accurate integration
  * 4. Output limiting: Prevents excessive corrections
@@ -219,9 +243,10 @@ float headingError(float target, float current)
  * @param pid      Pointer to PID controller structure
  * @param setpoint Desired value (angle for roll/pitch, rate for yaw)
  * @param measured Current measured value from sensors
+ * @param gyroRate Gyro rate in deg/s for this axis (used for D term)
  * @return         PID correction output
  */
-float computePID(PIDController *pid, float setpoint, float measured)
+float computePID(PIDController *pid, float setpoint, float measured, float gyroRate)
 {
   unsigned long now = micros();
 
@@ -277,9 +302,11 @@ float computePID(PIDController *pid, float setpoint, float measured)
   float I = pid->ki * pid->integral;
 
   // ---- DERIVATIVE TERM ----
-  // Derivative-on-measurement to prevent derivative kick
-  float dMeasurement = (measured - pid->prevMeasurement) / dt;
-  float D = -pid->kd * dMeasurement;
+  // Use gyro rate directly instead of differentiating the angle.
+  // Gyro gives a clean rate signal; differentiating the Mahony angle
+  // amplifies noise. The negative sign is because if the measurement
+  // is increasing (positive gyro rate), we want to resist that change.
+  float D = -pid->kd * gyroRate;
 
   // Store state for next iteration
   pid->prevTime = now;
@@ -421,25 +448,30 @@ void stopMotors()
 /**
  * Apply motor mixing for X-configuration quadcopter.
  *
+ * Physics of yaw mixing:
+ *   A CCW-spinning prop produces a CW reaction torque on the frame.
+ *   A CW-spinning prop produces a CCW reaction torque on the frame.
+ *   To yaw CW (positive yaw command): speed up CW motors, slow CCW motors.
+ *
  * Mixing equations:
  * - Throttle: All motors increase equally
  * - Roll (right = positive): Left motors increase, right motors decrease
  * - Pitch (forward = positive): Back motors increase, front motors decrease
- * - Yaw (CW = positive): CCW motors increase, CW motors decrease
+ * - Yaw (CW = positive): CW motors (TR,BL) increase, CCW motors (TL,BR) decrease
  */
 void mixMotors(int throttle, float roll, float pitch, float yaw)
 {
-  // Top Left (front-left, CCW): -pitch +roll +yaw
-  motorTL = throttle - pitch + roll + yaw;
+  // Top Left (front-left, CCW): -pitch +roll -yaw
+  motorTL = throttle - pitch + roll - yaw;
 
-  // Top Right (front-right, CW): -pitch -roll -yaw
-  motorTR = throttle - pitch - roll - yaw;
+  // Top Right (front-right, CW): -pitch -roll +yaw
+  motorTR = throttle - pitch - roll + yaw;
 
-  // Bottom Left (back-left, CW): +pitch +roll -yaw
-  motorBL = throttle + pitch + roll - yaw;
+  // Bottom Left (back-left, CW): +pitch +roll +yaw
+  motorBL = throttle + pitch + roll + yaw;
 
-  // Bottom Right (back-right, CCW): +pitch -roll +yaw
-  motorBR = throttle + pitch - roll + yaw;
+  // Bottom Right (back-right, CCW): +pitch -roll -yaw
+  motorBR = throttle + pitch - roll - yaw;
 
   // Constrain all motors to valid range
   motorTL = constrain(motorTL, MOTOR_MIN, MOTOR_MAX);
@@ -491,6 +523,7 @@ void processInputs()
   baseThrottle = map(rawThrottle, 0, 1023, 0, MOTOR_MAX);
 
   // ---- ROLL ----
+  // Uses fmap() for smooth float output instead of integer map()
   int rollInput = rxData.leftX - JOYSTICK_CENTER;
   if (abs(rollInput) < JOYSTICK_DEADBAND)
   {
@@ -498,7 +531,7 @@ void processInputs()
   }
   else
   {
-    targetRoll = map(rxData.leftX, 0, 1023, -MAX_ANGLE, MAX_ANGLE);
+    targetRoll = fmap((float)rxData.leftX, 0.0f, 1023.0f, -MAX_ANGLE, MAX_ANGLE);
   }
 
   // ---- PITCH ----
@@ -509,7 +542,7 @@ void processInputs()
   }
   else
   {
-    targetPitch = map(rxData.leftY, 0, 1023, -MAX_ANGLE, MAX_ANGLE);
+    targetPitch = fmap((float)rxData.leftY, 0.0f, 1023.0f, -MAX_ANGLE, MAX_ANGLE);
   }
 
   // ---- YAW (with heading hold) ----
@@ -533,7 +566,7 @@ void processInputs()
   {
     // Stick deflected: manual yaw rate mode
     headingHoldActive = false;
-    targetYawRate = map(rxData.rightX, 0, 1023, -MAX_YAW_RATE, MAX_YAW_RATE);
+    targetYawRate = fmap((float)rxData.rightX, 0.0f, 1023.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
   }
 }
 
@@ -602,9 +635,11 @@ void controlLoop()
   }
 
   // Compute PID corrections
-  float rollCorrection = computePID(&rollPID, targetRoll, currentRollAngle);
-  float pitchCorrection = computePID(&pitchPID, targetPitch, currentPitchAngle);
-  float yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate);
+  // Roll/Pitch: pass gyro rate for the D term (cleaner than differentiating angle)
+  // Yaw: gyro rate IS the measurement (rate mode PID)
+  float rollCorrection = computePID(&rollPID, targetRoll, currentRollAngle, getGyroRateX());
+  float pitchCorrection = computePID(&pitchPID, targetPitch, currentPitchAngle, getGyroRateY());
+  float yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate, currentYawRate);
 
   // Apply motor mixing
   mixMotors(baseThrottle, rollCorrection, pitchCorrection, yawCorrection);
@@ -706,9 +741,12 @@ void setup()
   Serial.println("IMU filter converged.");
 
   // Wait for ARM command from controller
+  // IMPORTANT: Keep updating IMU so the Mahony filter doesn't go stale
   Serial.println("Waiting for ARM command...");
   while (true)
   {
+    updateIMU(); // Keep filter running while waiting
+
     if (radio.available())
     {
       bool success = recieveData();
@@ -718,7 +756,7 @@ void setup()
         break;
       }
     }
-    delay(10);
+    delay(4); // ~250Hz to match filter rate
   }
 
   // Initialize control timing
@@ -800,10 +838,17 @@ void loop()
 
   // ---- FIXED-RATE CONTROL LOOP ----
   // Run at 250Hz for smooth control
-  unsigned long elapsed = nowMicros - lastControlTime;
-  if (elapsed >= CONTROL_LOOP_PERIOD_US)
+  // Use increment-by-period to prevent timing drift
+  if (nowMicros - lastControlTime >= CONTROL_LOOP_PERIOD_US)
   {
-    lastControlTime = nowMicros;
+    lastControlTime += CONTROL_LOOP_PERIOD_US;
+
+    // If we've fallen behind by more than one period, reset instead of
+    // trying to catch up (prevents burst of rapid iterations)
+    if (nowMicros - lastControlTime >= CONTROL_LOOP_PERIOD_US)
+    {
+      lastControlTime = nowMicros;
+    }
 
     // Update IMU data
     updateIMU();
