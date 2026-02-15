@@ -34,4 +34,4 @@ public:
     bool isBattery2Critical();
 };
 
-ADS1115 ads;
+extern ADS1115 ads;

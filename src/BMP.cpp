@@ -1,5 +1,7 @@
 #include <BMP.h>
 
+BMP bmp;
+
 bool BMP::initBMP()
 {
     if (!bmp.begin(0x76))

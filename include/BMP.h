@@ -21,4 +21,4 @@ public:
     float getRelativeAltitude();
 };
 
-BMP bmp;
+extern BMP bmp;

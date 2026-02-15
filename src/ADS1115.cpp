@@ -1,5 +1,7 @@
 #include "ADS1115.h"
 
+ADS1115 ads;
+
 bool ADS1115::initADS()
 {
     if (!ads.begin())
