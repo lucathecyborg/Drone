@@ -54,6 +54,8 @@
 #define FLAG_SET_HOME (1 << 4)       // set GPS home location
 #define FLAG_FREEZE (1 << 5)         // freeze input from controller
 
+// #define MOTORS_ENABLED
+
 bool holdingAltitude = false;
 int heldPower = 0;
 
@@ -423,10 +425,12 @@ int speedToDuty(int speed)
  */
 void writeMotors()
 {
+#ifdef MOTORS_ENABLED
   ledcWrite(TOPL_CHANNEL, speedToDuty(motorTL));
   ledcWrite(TOPR_CHANNEL, speedToDuty(motorTR));
   ledcWrite(BOTTOML_CHANNEL, speedToDuty(motorBL));
   ledcWrite(BOTTOMR_CHANNEL, speedToDuty(motorBR));
+#endif
 }
 
 /**
@@ -711,7 +715,7 @@ void setup()
     infiniteLoop();
   }
 
-  if (!bmp.initBMP())
+  /*if (!bmp.initBMP())
   {
     Serial.println("BMP failed to init, aborting.");
     infiniteLoop();
@@ -728,7 +732,7 @@ void setup()
     Serial.println("Motors failed to init, aborting.");
     infiniteLoop();
   }
-
+*/
   Serial.println("Keep drone LEVEL and STILL for filter convergence...");
   delay(2000);
 
@@ -742,7 +746,7 @@ void setup()
 
   // Wait for ARM command from controller
   // IMPORTANT: Keep updating IMU so the Mahony filter doesn't go stale
-  Serial.println("Waiting for ARM command...");
+  /*Serial.println("Waiting for ARM command...");
   while (true)
   {
     updateIMU(); // Keep filter running while waiting
@@ -757,7 +761,7 @@ void setup()
       }
     }
     delay(4); // ~250Hz to match filter rate
-  }
+  } */
 
   // Initialize control timing
   lastControlTime = micros();
@@ -772,11 +776,19 @@ void loop()
   unsigned long now = millis();
   unsigned long nowMicros = micros();
 
+  if (now - lastDebugTime >= 500)
+  {
+    lastDebugTime = now;
+    Serial.printf("Radio details - isChipConnected: %d | dataAvailable: %d | FIFO status: %d\n",
+                  radio.isChipConnected(),
+                  radio.available(),
+                  radio.isFifo(false, false));
+  }
   // ---- RECEIVE DATA FROM CONTROLLER ----
   if (radio.available())
   {
     bool success = recieveData();
-
+    Serial.println(rxData.throttle);
     if (success)
     {
       lastRxTime = now;
@@ -829,6 +841,10 @@ void loop()
       }
     }
   }
+  else
+  {
+    Serial.println("Not avalible");
+  }
 
   // ---- FAILSAFE CHECK ----
   if (armed && (now - lastRxTime > FAILSAFE_TIMEOUT_MS))
@@ -861,9 +877,9 @@ void loop()
   }
 
   // ---- DEBUG OUTPUT ----
-  if (now - lastDebugTime >= 200)
-  {
-    lastDebugTime = now;
-    printDebug();
-  }
+  /* if (now - lastDebugTime >= 200)
+   {
+     lastDebugTime = now;
+      printDebug();
+   } */
 }

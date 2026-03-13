@@ -1,6 +1,3 @@
 In main:
--create calibration function (for all modules)
--actually start reading values from modules
--add motors
--add pid
+-CHANGE CONTROLER PID VALUES TO MATCH DRONE
 -hope
