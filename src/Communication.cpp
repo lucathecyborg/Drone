@@ -115,14 +115,10 @@ void printRecievedData()
     Serial.println(rxData.leftX);
     Serial.print("leftY: ");
     Serial.println(rxData.leftY);
-    Serial.print("leftButton: ");
-    Serial.println(rxData.leftButton);
     Serial.print("rightX: ");
     Serial.println(rxData.rightX);
     Serial.print("rightY: ");
     Serial.println(rxData.rightY);
-    Serial.print("rightButton: ");
-    Serial.println(rxData.rightButton);
     Serial.print("Pid axis: ");
     Serial.println(rxData.pidAxis);
     Serial.print("Ki, Kp, Kd: ");

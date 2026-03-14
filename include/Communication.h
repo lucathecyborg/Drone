@@ -22,11 +22,9 @@ struct message
 {
     uint16_t leftX;
     uint16_t leftY;
-    bool leftButton;
 
     uint16_t rightX;
     uint16_t rightY;
-    bool rightButton;
 
     uint16_t throttle;
 
