@@ -54,10 +54,25 @@
 #define FLAG_SET_HOME (1 << 4)       // set GPS home location
 #define FLAG_FREEZE (1 << 5)         // freeze input from controller
 
-// #define MOTORS_ENABLED
+#define MOTORS_ENABLED
 
 bool holdingAltitude = false;
 int heldPower = 0;
+int startAltitude = 0;
+
+// Add these globals near your other control variables
+enum FailsafeState
+{
+  FS_NONE,
+  FS_DESCENDING,
+  FS_WAITING_FOR_MATCH
+};
+
+FailsafeState fsState = FS_NONE;
+int fsThrottle = 0; // Virtual throttle during failsafe
+unsigned long lastFsStepTime = 0;
+#define FS_STEP_INTERVAL_MS 200
+#define FS_STEP_SIZE 1
 
 // 16-bit PWM duty cycle values for 50Hz (20ms period)
 // duty = (pulse_us / 20000) * 65535
@@ -179,7 +194,7 @@ unsigned long lastDebugTime = 0;
 // Failsafe
 bool armed = false;
 unsigned long lastRxTime = 0;
-#define FAILSAFE_TIMEOUT_MS 500
+#define FAILSAFE_TIMEOUT_MS 1000
 
 // Heading hold
 float targetHeading = 0;
@@ -657,10 +672,74 @@ void controlLoop()
  */
 void failsafe()
 {
-  Serial.println("FAILSAFE: No signal from controller!");
-  stopMotors();
-  resetAllPIDs();
-  armed = false;
+  unsigned long now = millis();
+
+  // Entry: initialize fsThrottle from current base throttle
+  if (fsState == FS_NONE)
+  {
+    Serial.println("FAILSAFE: Signal lost, beginning descent");
+    fsThrottle = baseThrottle;
+    fsState = FS_DESCENDING;
+    lastFsStepTime = now;
+  }
+
+  if (fsState == FS_DESCENDING)
+  {
+    // Step down every 200ms
+    if (now - lastFsStepTime >= FS_STEP_INTERVAL_MS)
+    {
+      lastFsStepTime = now;
+      fsThrottle = max(0, fsThrottle - FS_STEP_SIZE);
+      Serial.printf("FAILSAFE: fsThrottle = %d\n", fsThrottle);
+    }
+
+    // Apply the virtual throttle directly, bypassing processInputs()
+    baseThrottle = fsThrottle;
+    mixMotors(baseThrottle, 0, 0, 0); // Level flight, no corrections
+    writeMotors();
+
+    // If signal comes back, transition to waiting-for-match
+    if (radio.available())
+    {
+      bool success = recieveData();
+      if (success)
+      {
+        lastRxTime = now;
+        fsState = FS_WAITING_FOR_MATCH;
+        Serial.printf("FAILSAFE: Signal restored. Waiting for throttle match at %d\n", fsThrottle);
+      }
+    }
+  }
+
+  if (fsState == FS_WAITING_FOR_MATCH)
+  {
+    // Keep descending while pilot brings throttle to match
+    if (now - lastFsStepTime >= FS_STEP_INTERVAL_MS)
+    {
+      lastFsStepTime = now;
+      fsThrottle = max(0, fsThrottle - FS_STEP_SIZE);
+    }
+
+    baseThrottle = fsThrottle;
+    mixMotors(baseThrottle, 0, 0, 0);
+    writeMotors();
+
+    // Resume normal control once received throttle is within range of fsThrottle
+    int receivedThrottle = map(rxData.throttle, 0, 1023, 0, MOTOR_MAX);
+    if (abs(receivedThrottle - fsThrottle) <= 20)
+    {
+      Serial.println("FAILSAFE: Throttle matched, resuming normal control");
+      fsState = FS_NONE;
+      armed = true;
+      resetAllPIDs();
+    }
+
+    // If signal is lost again, go back to pure descending
+    if (now - lastRxTime > FAILSAFE_TIMEOUT_MS)
+    {
+      fsState = FS_DESCENDING;
+    }
+  }
 }
 
 // ============================================================================
@@ -719,20 +798,20 @@ void setup()
   {
     Serial.println("BMP failed to init, aborting.");
     infiniteLoop();
-  }
-
-  if (!ads.initADS())
-  {
-    Serial.println("ADS failed to init, aborting.");
-    infiniteLoop();
-  }
-
+  }*/
+  /*
+    if (!ads.initADS())
+    {
+      Serial.println("ADS failed to init, aborting.");
+      infiniteLoop();
+    }
+  */
   if (!initMotors())
   {
     Serial.println("Motors failed to init, aborting.");
     infiniteLoop();
   }
-*/
+
   Serial.println("Keep drone LEVEL and STILL for filter convergence...");
   delay(2000);
 
@@ -746,7 +825,7 @@ void setup()
 
   // Wait for ARM command from controller
   // IMPORTANT: Keep updating IMU so the Mahony filter doesn't go stale
-  /*Serial.println("Waiting for ARM command...");
+  Serial.println("Waiting for ARM command...");
   while (true)
   {
     updateIMU(); // Keep filter running while waiting
@@ -761,13 +840,13 @@ void setup()
       }
     }
     delay(4); // ~250Hz to match filter rate
-  } */
+  }
 
   // Initialize control timing
   lastControlTime = micros();
   lastRxTime = millis();
   targetHeading = getCorrectedHeading(); // Initialize heading hold
-
+                                         //  startAltitude = bmp.getAltitude();
   Serial.println("Ready for flight!");
 }
 
@@ -849,7 +928,12 @@ void loop()
   // ---- FAILSAFE CHECK ----
   if (armed && (now - lastRxTime > FAILSAFE_TIMEOUT_MS))
   {
+    armed = false; // Prevent normal control loop from running
     failsafe();
+  }
+  else if (!armed && fsState != FS_NONE)
+  {
+    failsafe(); // Keep running the state machine until resolved
   }
 
   // ---- FIXED-RATE CONTROL LOOP ----
