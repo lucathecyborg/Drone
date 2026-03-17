@@ -4,7 +4,7 @@
 RF24 radio(CE_PIN, CSN_PIN);
 const byte address[6] = "NODE1";
 message rxData;
-uint16_t txBattery;
+uint16_t txBattery = 50;
 int lastPrintTime = 201;
 char space = ' ';
 CommStats commStats = {0, 0, 0, 0};

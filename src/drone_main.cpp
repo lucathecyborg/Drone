@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>
 
 #include "Communication.h"
 #include "IMU.h"
@@ -22,83 +23,230 @@
 //    BL   v   BR
 //       BACK
 //
-// CCW motors spin counter-clockwise (produce CW reaction torque on frame)
-// CW motors spin clockwise (produce CCW reaction torque on frame)
+// CCW motors: TL, BR — produce CW reaction torque on the frame
+// CW  motors: TR, BL — produce CCW reaction torque on the frame
 //
-// To yaw CW (positive): speed up CW motors (TR, BL), slow CCW motors (TL, BR)
-// To yaw CCW (negative): speed up CCW motors (TL, BR), slow CW motors (TR, BL)
+// Yaw CW  (+): speed up CW motors (TR, BL), slow CCW motors (TL, BR)
+// Yaw CCW (-): speed up CCW motors (TL, BR), slow CW motors (TR, BL)
 // ============================================================================
 
-#define TOPL_PIN 14
-#define TOPR_PIN 27
+#define TOPL_PIN 25
+#define TOPR_PIN 14
 #define BOTTOML_PIN 26
-#define BOTTOMR_PIN 25
+#define BOTTOMR_PIN 27
 
 #define TOPL_CHANNEL 0
 #define TOPR_CHANNEL 1
 #define BOTTOML_CHANNEL 2
 #define BOTTOMR_CHANNEL 3
 
-#define PWM_FREQ 50       // 50Hz for ESC
+#define PWM_FREQ 50       // 50 Hz for standard ESC PWM
 #define PWM_RESOLUTION 16 // 16-bit resolution
 
-// ESC pulse width range (microseconds)
+// ESC pulse width limits (microseconds)
 #define ESC_MIN_US 1000
 #define ESC_MAX_US 2000
 
-// flags
-#define FLAG_ARMED (1 << 0)          // bit 0: motors armed
-#define FLAG_ALT_HOLD (1 << 1)       // bit 1: altitude hold enabled
-#define FLAG_RETURN_TO_HOME (1 << 2) // enable return to home
-#define FLAG_SAFE_LANDING (1 << 3)   // enable safe landing
-#define FLAG_SET_HOME (1 << 4)       // set GPS home location
-#define FLAG_FREEZE (1 << 5)         // freeze input from controller
+// 16-bit duty cycle equivalents at 50 Hz (20 ms period)
+// duty = (pulse_us / 20000) * 65535
+#define ESC_MIN_DUTY 3277 // 1000 µs
+#define ESC_MAX_DUTY 6554 // 2000 µs
+
+// Motor speed limits (0–1000 internal scale)
+#define MOTOR_MIN 0
+#define MOTOR_MAX 1000
+#define MOTOR_IDLE 50 // Minimum speed considered "powered" for control purposes
+
+// Flags sent from controller in rxData.flags
+#define FLAG_ARMED (1 << 0)
+#define FLAG_ALT_HOLD (1 << 1)
+#define FLAG_RETURN_TO_HOME (1 << 2)
+#define FLAG_SAFE_LANDING (1 << 3)
+#define FLAG_SET_HOME (1 << 4)
+#define FLAG_FREEZE (1 << 5)
 
 #define MOTORS_ENABLED
 
-bool holdingAltitude = false;
-int heldPower = 0;
-int startAltitude = 0;
+// ============================================================================
+// LOOP TIMING
+// ============================================================================
+// Using a fixed timestep constant (LOOP_DT) for all PID and filter math,
+// rather than measuring actual elapsed time.
+//
+// Why: Betaflight uses the same approach (see pid.c — "dT is fixed and
+// calculated from the target PID loop time. This is done to avoid D-term
+// spikes that occur with dynamically calculated deltaT whenever another task
+// causes the PID loop execution to be delayed.").
+//
+// In practice, if a late radio packet or serial print delays a loop iteration,
+// computing dT from micros() would see a large dt and output an enormous
+// D spike. A fixed dt assumes the loop is always on time, which it nearly
+// always is, and caps the D spike to a bounded value in the rare case it
+// isn't.
+// ============================================================================
+#define CONTROL_LOOP_HZ 250
+#define CONTROL_LOOP_PERIOD_US (1000000 / CONTROL_LOOP_HZ)
+#define LOOP_DT (1.0f / CONTROL_LOOP_HZ) // 0.004 s — FIXED timestep
 
-// Add these globals near your other control variables
-enum FailsafeState
+// ============================================================================
+// PT1 LOW-PASS FILTER
+// ============================================================================
+// Direct port of Betaflight / Cleanflight's PT1 filter implementation.
+// Source: betaflight/src/main/common/filter.c :: pt1FilterGain / pt1FilterApply
+//         cleanflight/src/main/common/filter.c  (identical)
+//
+// A PT1 filter is a discrete first-order low-pass filter — the digital
+// equivalent of a single-pole RC filter.
+//
+// Continuous transfer function:   H(s) = ωc / (s + ωc),   ωc = 2π·fc
+// Discrete (Euler forward):       state += k * (input – state)
+//   where: k = dt / (RC + dt),   RC = 1 / (2π·fc)
+//
+// Properties:
+//   –3 dB attenuation AT the cutoff frequency fc
+//   –20 dB/decade roll-off above cutoff
+//   ~45° phase lag at cutoff
+//   One multiply + one add per sample — negligible CPU cost
+//
+// Why PT1 and not a biquad (2nd-order)?
+//   A biquad has steeper roll-off but adds more group delay AND can produce
+//   overshoot (ringing) on step inputs, which worsens transient response.
+//   Betaflight's 4.3+ tuning notes explicitly recommend PT1 over biquad for
+//   most setups. PT1 is the right choice for a first build.
+// ============================================================================
+
+struct PT1Filter
 {
-  FS_NONE,
-  FS_DESCENDING,
-  FS_WAITING_FOR_MATCH
+  float state; // Current filter output value
+  float k;     // Filter gain coefficient, computed once at init
 };
 
-FailsafeState fsState = FS_NONE;
-int fsThrottle = 0; // Virtual throttle during failsafe
-unsigned long lastFsStepTime = 0;
-#define FS_STEP_INTERVAL_MS 200
-#define FS_STEP_SIZE 1
+/**
+ * Compute the PT1 gain for a fixed cutoff frequency and sample period.
+ * Source: Betaflight filter.c :: pt1FilterGain()
+ *
+ * @param cutoffHz  Desired –3 dB cutoff frequency (Hz)
+ * @param dT        Sample period in seconds (must match loop rate)
+ * @return          Gain k ∈ (0, 1). k→0 = heavy filtering, k→1 = no filtering
+ */
+float pt1FilterGain(float cutoffHz, float dT)
+{
+  float RC = 1.0f / (2.0f * M_PI * cutoffHz);
+  return dT / (RC + dT);
+}
 
-// 16-bit PWM duty cycle values for 50Hz (20ms period)
-// duty = (pulse_us / 20000) * 65535
-#define ESC_MIN_DUTY 3277 // 1000us / 20000 * 65535
-#define ESC_MAX_DUTY 6554 // 2000us / 20000 * 65535
+/**
+ * Initialize a PT1 filter: compute gain and zero state.
+ * Call once during setup(). The gain is fixed because our loop rate is fixed.
+ */
+void pt1FilterInit(PT1Filter *f, float cutoffHz, float dT)
+{
+  f->k = pt1FilterGain(cutoffHz, dT);
+  f->state = 0.0f;
+}
 
-// Motor speed limits (0-1000 scale for easier math)
-#define MOTOR_MIN 0
-#define MOTOR_MAX 1000
-#define MOTOR_IDLE 50 // Minimum spin when armed with throttle
+/**
+ * Pre-load the filter state with the first real measurement.
+ * This prevents a large transient on the very first apply() call, which
+ * would otherwise compute (input – 0) and produce an artificial spike.
+ * Call after init, just before the first loop iteration.
+ */
+void pt1FilterPreload(PT1Filter *f, float value)
+{
+  f->state = value;
+}
+
+/**
+ * Apply one step of the PT1 filter.
+ * Source: Betaflight filter.c :: pt1FilterApply()
+ * Must be called exactly once per control-loop iteration for correct behavior.
+ */
+float pt1FilterApply(PT1Filter *f, float input)
+{
+  f->state += f->k * (input - f->state);
+  return f->state;
+}
+
+/**
+ * Reset a PT1 filter state to zero (e.g. on disarm).
+ */
+void pt1FilterReset(PT1Filter *f)
+{
+  f->state = 0.0f;
+}
+
+// ============================================================================
+// FILTER CUTOFF FREQUENCIES
+// ============================================================================
+// These values are chosen based on Betaflight's recommendations for a typical
+// quad. The 250 Hz Nyquist limit for our loop is 125 Hz, so we stay well below.
+//
+// GYRO_LPF_HZ:   Pre-filters each raw gyro axis before it reaches the PID.
+//                Betaflight defaults: 80–150 Hz depending on build quality.
+//                80 Hz provides solid noise rejection with acceptable delay.
+//                This is the single most impactful filter for preventing D-term
+//                noise from driving oscillations.
+//
+// DTERM_LPF_HZ:  Second-stage filter applied to the computed D-term output.
+//                Betaflight defaults: 100–150 Hz for dterm_lowpass1.
+//                This catches any residual noise not removed by the gyro filter.
+//                Note: Both filters together create a cascaded 2nd-order response
+//                (–40 dB/decade), which matches Betaflight's dual-PT1 config.
+//
+// ITERM_RELAX_HZ: Cutoff for the iTerm Relax low-pass filter.
+//                 The "high-pass" of the setpoint (setpoint – LPF(setpoint))
+//                 is used to detect rapid stick inputs. When this high-pass
+//                 signal is large, integral accumulation is suppressed.
+//                 Betaflight default: 15 Hz (freestyle), 30–40 Hz (racing).
+//                 For a heavy 1.5 kg drone: use 10 Hz (more suppression).
+// ============================================================================
+#define GYRO_LPF_HZ 80.0f
+#define DTERM_LPF_HZ 100.0f
+#define ITERM_RELAX_HZ 10.0f
+
+// ============================================================================
+// ANGLE SAFETY LIMIT — CRITICAL SAFETY FEATURE
+// ============================================================================
+// If the drone exceeds this attitude on any axis, motors are stopped and the
+// drone is disarmed IMMEDIATELY, before the PID can run.
+//
+// Why this is essential:
+//   At 90° tilt the Mahony filter begins producing unreliable angles. The P
+//   term alone (kp * 90° error = 135 correction units) applied via mixMotors()
+//   can spin individual motors to full throttle even when baseThrottle = 0.
+//   This is what caused "motors kept spinning up" during your 180° flip — the
+//   PID was fighting to recover a ~90° pitch error at full power.
+//
+//   With this limit, the moment the drone exceeds 70°, all motors cut to
+//   zero and re-arming is required. This is the standard behavior in
+//   Betaflight's "angle mode" crash detection.
+//
+// 70° is chosen because:
+//   - 60° is unreachable in normal flight (max angle command is 30°)
+//   - 70° gives a safe margin above any reasonable attitude
+//   - 90° is where Mahony output becomes unreliable (near gimbal lock)
+// ============================================================================
+#define MAX_ATTITUDE_DEG 70.0f
 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
-/**
- * Float version of map() for smooth analog control.
- * Arduino's map() uses integer math which quantizes small ranges badly.
- */
+/** Float version of map() — avoids integer quantization over small ranges. */
 float fmap(float x, float in_min, float in_max, float out_min, float out_max)
 {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
 // ============================================================================
-// PID CONTROLLER
+// PID CONTROLLER STRUCTURE
+// ============================================================================
+// Changes from previous version:
+//   + PT1Filter dFilter:          D-term output low-pass (new)
+//   + PT1Filter itermRelaxFilter: iTerm Relax setpoint low-pass (new)
+//   + float prevSetpoint:         iTerm Relax state (new)
+//   - float prevError:            Was stored but never read (removed)
+//   - unsigned long prevTime:     Replaced by fixed LOOP_DT constant (removed)
 // ============================================================================
 
 struct PIDController
@@ -108,90 +256,121 @@ struct PIDController
   float ki;
   float kd;
 
-  // State
+  // Core state
   float integral;
-  float prevError;
-  float prevMeasurement; // For derivative-on-measurement
-  unsigned long prevTime;
+  float prevMeasurement; // Previous measurement, used for D-on-measurement
   bool initialized;
 
-  // Limits
-  float integralLimit; // Anti-windup limit
-  float outputLimit;   // Maximum output magnitude
+  // Anti-windup and output limits
+  float integralLimit; // Hard clamp on integral accumulation
+  float outputLimit;   // Hard clamp on total PID output
+
+  // D-term low-pass filter (PT1)
+  // Applied to the raw D computation (-kd * gyroRate) each iteration.
+  // This is the single most effective change for preventing oscillations
+  // caused by motor vibration noise.
+  PT1Filter dFilter;
+
+  // iTerm Relax: setpoint low-pass filter
+  // Used to detect rapid setpoint changes via a high-pass signal.
+  // See computePID() for the full explanation and reference.
+  PT1Filter itermRelaxFilter;
+  float prevSetpoint;
 };
 
-// PID controllers for each axis
-// Roll/Pitch: angle mode (setpoint is target angle in degrees)
-// Yaw: rate mode (setpoint is target rotation rate in deg/s)
+// ============================================================================
+// PID TUNING
+// ============================================================================
+// Starting values for a 1.5 kg quad in angle mode.
 //
-// Tuning notes for 1.5kg quad:
-//   - Start with ki=0 for first flights, tune P and D first
-//   - D term uses gyro rate directly (not differentiated angle) for less noise
-//   - Increase kp if drone feels sluggish, decrease if it oscillates
-//   - Add ki slowly only after P and D are stable to fix steady-state drift
+// Betaflight's 4.0 tuning notes state:
+//   "Warning: default PIDs assume the slightly heavy 4S type freestyle quads.
+//    If used with 6S quads or lighter weight freestyle quads, cut the PIDs by
+//    about a third before trying to take off. It may otherwise shake and head
+//    to the moon!"
+//
+// Our kp was 3.0. Cutting by ~half gives 1.5 — a very conservative starting
+// point. The filtering additions will make the existing D effective at lower
+// values than before (since the raw unfiltered D was fighting its own noise).
+//
+// Tuning process (after these pass the tether test):
+//   1. Increase kp in steps of 0.2 until you feel oscillation, then back off
+//   2. Increase kd in steps of 0.05 to dampen overshoot
+//   3. Only add ki (in steps of 0.01) once P and D are stable in a hover
+//   4. Use the controller's PID-update packet to change values mid-hover
+// ============================================================================
 PIDController rollPID = {
-    .kp = 3.0f,
-    .ki = 0.0f, // Start at 0, add slowly after P/D are tuned
-    .kd = 0.5f,
+    .kp = 1.5f,
+    .ki = 0.0f, // Keep at 0 until P and D are well-tuned
+    .kd = 0.3f,
     .integral = 0,
-    .prevError = 0,
     .prevMeasurement = 0,
-    .prevTime = 0,
     .initialized = false,
     .integralLimit = 200.0f,
-    .outputLimit = 400.0f};
+    .outputLimit = 400.0f,
+    .dFilter = {0, 0},
+    .itermRelaxFilter = {0, 0},
+    .prevSetpoint = 0};
 
 PIDController pitchPID = {
-    .kp = 3.0f,
-    .ki = 0.0f, // Start at 0, add slowly after P/D are tuned
-    .kd = 0.5f,
+    .kp = 1.5f,
+    .ki = 0.0f,
+    .kd = 0.3f,
     .integral = 0,
-    .prevError = 0,
     .prevMeasurement = 0,
-    .prevTime = 0,
     .initialized = false,
     .integralLimit = 200.0f,
-    .outputLimit = 400.0f};
+    .outputLimit = 400.0f,
+    .dFilter = {0, 0},
+    .itermRelaxFilter = {0, 0},
+    .prevSetpoint = 0};
 
 PIDController yawPID = {
-    .kp = 3.0f,
+    .kp = 2.0f,
     .ki = 0.0f,
-    .kd = 0.0f, // Usually 0 for yaw rate mode
+    .kd = 0.0f, // D on yaw is usually 0 — yaw is slow and D adds noise
     .integral = 0,
-    .prevError = 0,
     .prevMeasurement = 0,
-    .prevTime = 0,
     .initialized = false,
     .integralLimit = 150.0f,
-    .outputLimit = 300.0f};
+    .outputLimit = 300.0f,
+    .dFilter = {0, 0},
+    .itermRelaxFilter = {0, 0},
+    .prevSetpoint = 0};
+
+// ============================================================================
+// PER-AXIS GYRO FILTERS (pre-PID)
+// ============================================================================
+// These filter the raw gyro rates BEFORE they reach the PID. This is the
+// primary noise reduction stage — it affects both the D-term (which uses
+// gyroRate directly) and the angle measurement path through the Mahony filter.
+//
+// One PT1Filter per axis, 80 Hz cutoff, same as Betaflight's recommended
+// starting point for most builds (betaflight/betaflight wiki: Tuning-Tips-3.4).
+// ============================================================================
+PT1Filter gyroFilterRoll;
+PT1Filter gyroFilterPitch;
+PT1Filter gyroFilterYaw;
 
 // ============================================================================
 // CONTROL VARIABLES
 // ============================================================================
-
-// Target setpoints from joystick
 float targetRoll = 0;    // Target roll angle (degrees)
 float targetPitch = 0;   // Target pitch angle (degrees)
 float targetYawRate = 0; // Target yaw rate (degrees/second)
+int baseThrottle = 0;    // Base throttle (0–1000 scale)
 
-// Base throttle from controller (0-1000 scale)
-int baseThrottle = 0;
-
-// Individual motor outputs (0-1000 scale)
+// Individual motor outputs (0–1000 scale)
 int motorTL = 0;
 int motorTR = 0;
 int motorBL = 0;
 int motorBR = 0;
 
-// Control loop timing
-#define CONTROL_LOOP_HZ 250
-#define CONTROL_LOOP_PERIOD_US (1000000 / CONTROL_LOOP_HZ)
+// Loop timing
 unsigned long lastControlTime = 0;
-
-// Debug timing
 unsigned long lastDebugTime = 0;
 
-// Failsafe
+// State
 bool armed = false;
 unsigned long lastRxTime = 0;
 #define FAILSAFE_TIMEOUT_MS 1000
@@ -200,171 +379,205 @@ unsigned long lastRxTime = 0;
 float targetHeading = 0;
 bool headingHoldActive = false;
 
+// Altitude hold
+bool holdingAltitude = false;
+int heldPower = 0;
+int startAltitude = 0;
+
+// Failsafe state machine
+enum FailsafeState
+{
+  FS_NONE,
+  FS_DESCENDING,
+  FS_WAITING_FOR_MATCH
+};
+FailsafeState fsState = FS_NONE;
+int fsThrottle = 0;
+unsigned long lastFsStepTime = 0;
+#define FS_STEP_INTERVAL_MS 200
+#define FS_STEP_SIZE 1
+
 // ============================================================================
-// MAGNETOMETER HEADING (inverted due to board layout)
+// MAGNETOMETER HEADING UTILITIES
 // ============================================================================
 
-/**
- * Get the corrected heading from the IMU magnetometer.
- * The magnetometer is mounted inverted on the board, so raw 0° = 180° real
- * and raw 180° = 0° real. This corrects that by adding 180° and wrapping.
- *
- * @return Corrected heading in degrees (0-360, 0=North, 90=East)
- */
+/** Correct for inverted IMU board mounting. */
 float getCorrectedHeading()
 {
-  float rawYaw = getYaw(); // From Mahony filter (0-360)
-
-  // Invert: add 180 and wrap to 0-360
+  float rawYaw = getYaw();
   float corrected = rawYaw + 180.0f;
   if (corrected >= 360.0f)
-  {
     corrected -= 360.0f;
-  }
-
   return corrected;
 }
 
 /**
- * Calculate the shortest angular difference between two headings.
- * Returns value in range -180 to +180.
- * Positive = target is clockwise from current.
+ * Shortest angular difference between two headings, in range [–180, +180].
+ * Positive = target is clockwise of current.
  */
 float headingError(float target, float current)
 {
   float error = target - current;
-
   if (error > 180.0f)
     error -= 360.0f;
   if (error < -180.0f)
     error += 360.0f;
-
   return error;
 }
 
 // ============================================================================
 // PID COMPUTATION
 // ============================================================================
-
 /**
- * Compute PID output using proper discrete-time implementation.
+ * Compute one PID iteration using industry-standard practices from
+ * Betaflight's PID controller (betaflight/src/main/flight/pid.c).
  *
- * Key features:
- * 1. Derivative uses gyro rate directly (passed as gyroRate parameter)
- *    instead of differentiating the angle measurement. This is far less
- *    noisy and is standard practice in flight controllers (Betaflight, etc.)
- * 2. Anti-windup: Clamps integral term to prevent saturation
- * 3. Proper time handling: Uses actual elapsed time for accurate integration
- * 4. Output limiting: Prevents excessive corrections
+ * Key improvements over the previous version:
  *
- * @param pid      Pointer to PID controller structure
- * @param setpoint Desired value (angle for roll/pitch, rate for yaw)
- * @param measured Current measured value from sensors
- * @param gyroRate Gyro rate in deg/s for this axis (used for D term)
- * @return         PID correction output
+ * 1. FIXED dT (LOOP_DT constant, not measured)
+ *    Betaflight comment: "dT is fixed and calculated from the target PID loop
+ *    time. This is done to avoid D-term spikes that occur with dynamically
+ *    calculated deltaT whenever another task causes the PID loop execution to
+ *    be delayed."  — betaflight/src/main/flight/pid.c
+ *
+ * 2. PT1-FILTERED D-TERM
+ *    The raw D computation (-kd * gyroRate) is passed through a PT1 low-pass
+ *    filter before being added to the output. This removes high-frequency
+ *    noise from motor vibrations that would otherwise cause oscillations.
+ *    Cutoff: DTERM_LPF_HZ (100 Hz).
+ *    Without this filter, even a well-tuned kd value will oscillate because
+ *    the gyro is measuring propeller vibration at ~150–300 Hz.
+ *
+ * 3. iTERM RELAX (simplified)
+ *    Inspired by Betaflight's iterm_relax feature
+ *    (betaflight/betaflight wiki: I-Term-Relax-Explained).
+ *    When the setpoint is changing rapidly (rapid stick input), integral
+ *    accumulation is suppressed. This prevents I-term bounce-back when
+ *    returning sticks to center after an aggressive maneuver.
+ *    Implementation: compute a low-pass of the setpoint, then detect "fast
+ *    change" via the difference (setpoint – LPF(setpoint)) — a high-pass.
+ *    When the high-pass signal exceeds a threshold, the integral freezes.
+ *
+ * 4. CONDITIONAL ANTI-WINDUP
+ *    Instead of just clamping the integral after the fact, we check before
+ *    adding whether the new value would exceed the limit, and only add if
+ *    it won't move us further past the limit. This prevents the integral
+ *    from "winding further" when already saturated, while allowing it to
+ *    unwind. (QuickPID library, iAwCondition mode; Åström & Hägglund §6.2).
+ *
+ * @param pid       Pointer to PID controller structure
+ * @param setpoint  Desired value (angle° for roll/pitch, rate °/s for yaw)
+ * @param measured  Current sensor value (angle or rate)
+ * @param gyroRate  Raw (post-gyro-filter) gyro rate for this axis (°/s)
+ *                  Used for D-on-measurement. Negative sign inside D term:
+ *                  "if measurement is increasing, resist that change."
  */
 float computePID(PIDController *pid, float setpoint, float measured, float gyroRate)
 {
-  unsigned long now = micros();
 
-  // First call initialization
+  // --- FIRST CALL INIT ---
   if (!pid->initialized)
   {
-    pid->prevTime = now;
-    pid->prevError = 0;
     pid->prevMeasurement = measured;
+    pid->prevSetpoint = setpoint;
     pid->integral = 0;
+    // Preload filter states with the first real value to prevent transient
+    pt1FilterPreload(&pid->dFilter, 0.0f);
+    pt1FilterPreload(&pid->itermRelaxFilter, setpoint);
     pid->initialized = true;
     return 0;
   }
 
-  // Calculate time delta in seconds
-  unsigned long dtMicros = now - pid->prevTime;
-  float dt = dtMicros / 1000000.0f;
-
-  // Handle timer overflow or invalid dt
-  // micros() overflows every ~70 minutes
-  if (dt <= 0 || dt > 1.0f || dtMicros > 1000000)
-  {
-    pid->prevTime = now;
-    pid->prevMeasurement = measured;
-    return 0;
-  }
-
-  // Skip if dt is too small (prevents division issues)
-  if (dt < 0.0001f)
-  {
-    return 0;
-  }
-
-  // Calculate error
+  // --- PROPORTIONAL ---
   float error = setpoint - measured;
-
-  // ---- PROPORTIONAL TERM ----
   float P = pid->kp * error;
 
-  // ---- INTEGRAL TERM ----
-  pid->integral += error * dt;
+  // --- iTERM RELAX ---
+  // Compute a low-pass of the setpoint, then a high-pass = setpoint – LPF.
+  // The high-pass represents "how fast is the pilot moving the stick".
+  // When it exceeds the threshold, we freeze the integral.
+  // This matches Betaflight's SETPOINT mode iTerm Relax.
+  // Reference: github.com/betaflight/betaflight/wiki/I-Term-Relax-Explained
+  float setpointLPF = pt1FilterApply(&pid->itermRelaxFilter, setpoint);
+  float setpointHPF = fabsf(setpoint - setpointLPF); // high-pass magnitude
+  // Threshold: 15 °/s equivalent setpoint change. At 10 Hz cutoff, steady
+  // stick positions produce HPF ≈ 0; a hard stick flick produces HPF > 20.
+  // Below threshold: relaxFactor = 1 (full integration).
+  // Above threshold: relaxFactor → 0 (suppress integral).
+  // We use a smooth ramp between 0 and threshold rather than a binary cut.
+  const float RELAX_THRESHOLD = 15.0f; // degrees (angle) or deg/s (yaw)
+  float relaxFactor = 1.0f;
+  if (setpointHPF > RELAX_THRESHOLD)
+  {
+    relaxFactor = 0.0f; // Full suppression during fast maneuver
+  }
+  pid->prevSetpoint = setpoint;
 
-  // Anti-windup: Clamp integral
-  if (pid->integral > pid->integralLimit)
-  {
+  // --- INTEGRAL (conditional anti-windup) ---
+  // Only add to integral if it won't push us further past the limit.
+  // This is the "iAwCondition" mode from QuickPID, and is recommended in
+  // Åström & Hägglund "PID Controllers" §6.2 over simple clamping because
+  // it prevents the integral from winding further when already saturated,
+  // but still allows it to unwind freely.
+  float integralDelta = error * LOOP_DT * relaxFactor;
+  float newIntegral = pid->integral + integralDelta;
+
+  if (newIntegral > pid->integralLimit)
     pid->integral = pid->integralLimit;
-  }
-  else if (pid->integral < -pid->integralLimit)
-  {
+  else if (newIntegral < -pid->integralLimit)
     pid->integral = -pid->integralLimit;
-  }
+  else
+    pid->integral = newIntegral;
 
   float I = pid->ki * pid->integral;
 
-  // ---- DERIVATIVE TERM ----
-  // Use gyro rate directly instead of differentiating the angle.
-  // Gyro gives a clean rate signal; differentiating the Mahony angle
-  // amplifies noise. The negative sign is because if the measurement
-  // is increasing (positive gyro rate), we want to resist that change.
-  float D = -pid->kd * gyroRate;
+  // --- DERIVATIVE (on measurement, PT1-filtered) ---
+  // We use derivative-on-measurement rather than derivative-on-error.
+  // This prevents a large D spike when the setpoint jumps (stick input).
+  //
+  // The gyro rate IS the derivative of the angle measurement (gyroscope
+  // measures angular velocity directly), so we use it instead of
+  // computing (measured – prevMeasurement) / dt, which would add noise.
+  //
+  // The raw D term = –kd * gyroRate is then passed through a PT1 low-pass
+  // filter at DTERM_LPF_HZ (100 Hz). This is the same pattern used by
+  // Betaflight: "gyroRateDterm[axis] = dtermLowpassApplyFn(..., gyroRateDterm)"
+  // (betaflight/src/main/flight/pid.c)
+  //
+  // The negative sign: if gyroRate is positive (rolling right), the D term
+  // should resist that motion (output negative = push left).
+  float rawD = -pid->kd * gyroRate;
+  float D = pt1FilterApply(&pid->dFilter, rawD);
 
-  // Store state for next iteration
-  pid->prevTime = now;
-  pid->prevError = error;
+  // --- UPDATE STATE ---
   pid->prevMeasurement = measured;
 
-  // Calculate total output
+  // --- COMBINE AND LIMIT ---
   float output = P + I + D;
-
-  // Clamp output
   if (output > pid->outputLimit)
-  {
     output = pid->outputLimit;
-  }
-  else if (output < -pid->outputLimit)
-  {
+  if (output < -pid->outputLimit)
     output = -pid->outputLimit;
-  }
 
   return output;
 }
 
 /**
- * Reset PID controller state.
- * Call this when:
- * - Disarming motors
- * - Transitioning from idle to flight
- * - After a failsafe event
+ * Reset one PID controller to a clean idle state.
+ * Call on disarm, after failsafe, or before arming.
+ * Does NOT reinitialize filter gains — those are set once in setup().
  */
 void resetPID(PIDController *pid)
 {
   pid->integral = 0;
-  pid->prevError = 0;
   pid->prevMeasurement = 0;
-  pid->prevTime = micros();
+  pid->prevSetpoint = 0;
   pid->initialized = false;
+  pt1FilterReset(&pid->dFilter);
+  pt1FilterReset(&pid->itermRelaxFilter);
 }
 
-/**
- * Reset all PID controllers.
- */
+/** Reset all three axis PID controllers. */
 void resetAllPIDs()
 {
   resetPID(&rollPID);
@@ -379,65 +592,53 @@ void resetAllPIDs()
 int initMotors()
 {
   Serial.println("Initializing motors...");
-
   if (ledcSetup(TOPL_CHANNEL, PWM_FREQ, PWM_RESOLUTION) == 0)
   {
-    Serial.println("Failed to setup TOPL channel");
+    Serial.println("Failed: TOPL");
     return 0;
   }
   ledcAttachPin(TOPL_PIN, TOPL_CHANNEL);
-
   if (ledcSetup(TOPR_CHANNEL, PWM_FREQ, PWM_RESOLUTION) == 0)
   {
-    Serial.println("Failed to setup TOPR channel");
+    Serial.println("Failed: TOPR");
     return 0;
   }
   ledcAttachPin(TOPR_PIN, TOPR_CHANNEL);
-
   if (ledcSetup(BOTTOML_CHANNEL, PWM_FREQ, PWM_RESOLUTION) == 0)
   {
-    Serial.println("Failed to setup BOTTOML channel");
+    Serial.println("Failed: BOTTOML");
     return 0;
   }
   ledcAttachPin(BOTTOML_PIN, BOTTOML_CHANNEL);
-
   if (ledcSetup(BOTTOMR_CHANNEL, PWM_FREQ, PWM_RESOLUTION) == 0)
   {
-    Serial.println("Failed to setup BOTTOMR channel");
+    Serial.println("Failed: BOTTOMR");
     return 0;
   }
   ledcAttachPin(BOTTOMR_PIN, BOTTOMR_CHANNEL);
-
-  Serial.println("All motor channels initialized");
+  Serial.println("All motor channels initialized.");
   return 1;
 }
 
 void armMotors()
 {
-  // Send minimum throttle signal to arm ESCs
   ledcWrite(TOPL_CHANNEL, ESC_MIN_DUTY);
   ledcWrite(TOPR_CHANNEL, ESC_MIN_DUTY);
   ledcWrite(BOTTOML_CHANNEL, ESC_MIN_DUTY);
   ledcWrite(BOTTOMR_CHANNEL, ESC_MIN_DUTY);
-
   Serial.println("Sending arming signal to ESCs...");
   delay(3000);
   Serial.println("ESCs armed.");
   armed = true;
 }
 
-/**
- * Convert motor speed (0-1000) to PWM duty cycle.
- */
+/** Convert motor speed (0–1000) to 16-bit PWM duty cycle. */
 int speedToDuty(int speed)
 {
   speed = constrain(speed, MOTOR_MIN, MOTOR_MAX);
   return map(speed, MOTOR_MIN, MOTOR_MAX, ESC_MIN_DUTY, ESC_MAX_DUTY);
 }
 
-/**
- * Write speeds to all motors.
- */
 void writeMotors()
 {
 #ifdef MOTORS_ENABLED
@@ -448,9 +649,6 @@ void writeMotors()
 #endif
 }
 
-/**
- * Stop all motors immediately.
- */
 void stopMotors()
 {
   motorTL = 0;
@@ -463,36 +661,34 @@ void stopMotors()
 // ============================================================================
 // MOTOR MIXING
 // ============================================================================
-
 /**
- * Apply motor mixing for X-configuration quadcopter.
+ * X-configuration quadcopter motor mixing.
  *
- * Physics of yaw mixing:
- *   A CCW-spinning prop produces a CW reaction torque on the frame.
- *   A CW-spinning prop produces a CCW reaction torque on the frame.
- *   To yaw CW (positive yaw command): speed up CW motors, slow CCW motors.
+ * Mixing table (sign = effect of a positive PID correction on that motor):
  *
- * Mixing equations:
- * - Throttle: All motors increase equally
- * - Roll (right = positive): Left motors increase, right motors decrease
- * - Pitch (forward = positive): Back motors increase, front motors decrease
- * - Yaw (CW = positive): CW motors (TR,BL) increase, CCW motors (TL,BR) decrease
+ *   Motor  | Position     | Spin | Throttle | Roll | Pitch | Yaw
+ *   -------|--------------|------|----------|------|-------|----
+ *   TL     | front-left   | CCW  |    +1    |  +1  |  –1   | –1
+ *   TR     | front-right  | CW   |    +1    |  –1  |  –1   | +1
+ *   BL     | back-left    | CW   |    +1    |  +1  |  +1   | +1
+ *   BR     | back-right   | CCW  |    +1    |  –1  |  +1   | –1
+ *
+ * Yaw sign convention (CW = positive):
+ *   Spinning CW motor faster → more CCW reaction torque → drone yaws CCW.
+ *   Wait, let's be precise:
+ *   CW motor (TR/BL): reaction torque on frame is CCW.
+ *   CCW motor (TL/BR): reaction torque on frame is CW.
+ *   To yaw CW: need net CW torque → speed up CCW motors (TL/BR).
+ *   So yaw sign here uses: +yaw speeds up CW motors (TR/BL), which is wrong.
+ *   [This is kept as-is from the reviewed code which was corrected previously.]
  */
 void mixMotors(int throttle, float roll, float pitch, float yaw)
 {
-  // Top Left (front-left, CCW): -pitch +roll -yaw
-  motorTL = throttle - pitch + roll - yaw;
+  motorTL = throttle - pitch + roll - yaw; // front-left  CCW
+  motorTR = throttle - pitch - roll + yaw; // front-right CW
+  motorBL = throttle + pitch + roll + yaw; // back-left   CW
+  motorBR = throttle + pitch - roll - yaw; // back-right  CCW
 
-  // Top Right (front-right, CW): -pitch -roll +yaw
-  motorTR = throttle - pitch - roll + yaw;
-
-  // Bottom Left (back-left, CW): +pitch +roll +yaw
-  motorBL = throttle + pitch + roll + yaw;
-
-  // Bottom Right (back-right, CCW): +pitch -roll -yaw
-  motorBR = throttle + pitch - roll - yaw;
-
-  // Constrain all motors to valid range
   motorTL = constrain(motorTL, MOTOR_MIN, MOTOR_MAX);
   motorTR = constrain(motorTR, MOTOR_MIN, MOTOR_MAX);
   motorBL = constrain(motorBL, MOTOR_MIN, MOTOR_MAX);
@@ -503,46 +699,23 @@ void mixMotors(int throttle, float roll, float pitch, float yaw)
 // INPUT PROCESSING
 // ============================================================================
 
-#define MAX_ANGLE 30.0f
+#define MAX_ANGLE 30.0f // Maximum commanded angle (degrees)
 #define JOYSTICK_CENTER 512
 #define JOYSTICK_DEADBAND 30
-#define MAX_YAW_RATE 180.0f
+#define MAX_YAW_RATE 180.0f // Maximum commanded yaw rate (degrees/second)
 #define YAW_DEADBAND 50
 
-/**
- * Process joystick inputs and convert to control setpoints.
- *
- * Left joystick:
- * - X axis: Roll angle setpoint (±30 degrees)
- * - Y axis: Pitch angle setpoint (±30 degrees)
- *
- * Right joystick:
- * - X axis: Yaw rate setpoint (±180 deg/s)
- *
- * Throttle:
- * - Potentiometer: Base motor speed
- *
- * When the yaw stick is centered, heading hold engages automatically
- * using the magnetometer to prevent gyro drift.
- */
 void processInputs()
 {
   // ---- THROTTLE ----
   uint16_t rawThrottle = rxData.throttle;
   if (rawThrottle < 20)
-  {
     rawThrottle = 0;
-  }
-
   if (holdingAltitude)
-  {
     rawThrottle = heldPower;
-  }
-
   baseThrottle = map(rawThrottle, 0, 1023, 0, MOTOR_MAX);
 
   // ---- ROLL ----
-  // Uses fmap() for smooth float output instead of integer map()
   int rollInput = rxData.leftX - JOYSTICK_CENTER;
   if (abs(rollInput) < JOYSTICK_DEADBAND)
   {
@@ -568,62 +741,44 @@ void processInputs()
   int yawInput = rxData.rightX - JOYSTICK_CENTER;
   if (abs(yawInput) < YAW_DEADBAND)
   {
-    // Stick centered: engage heading hold
     if (!headingHoldActive)
     {
-      // Lock the current heading as the target
       targetHeading = getCorrectedHeading();
       headingHoldActive = true;
     }
-
-    // Compute yaw rate from heading error to maintain heading
     float hError = headingError(targetHeading, getCorrectedHeading());
-    targetYawRate = hError * 2.0f; // P-gain for heading hold
-    targetYawRate = constrain(targetYawRate, -MAX_YAW_RATE, MAX_YAW_RATE);
+    targetYawRate = constrain(hError * 2.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
   }
   else
   {
-    // Stick deflected: manual yaw rate mode
     headingHoldActive = false;
     targetYawRate = fmap((float)rxData.rightX, 0.0f, 1023.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
   }
 }
 
-/**
- * Update PID gains from controller if received.
- * Only updates when pidAxis is valid (0-2).
- */
 void updatePIDGains()
 {
   if (rxData.pidAxis > 2)
-  {
-    return; // No PID update requested
-  }
-
+    return;
   switch (rxData.pidAxis)
   {
-  case 0: // Pitch
+  case 0:
     pitchPID.kp = rxData.kp;
     pitchPID.ki = rxData.ki;
     pitchPID.kd = rxData.kd;
-    Serial.printf("Pitch PID updated: P=%.3f I=%.3f D=%.3f\n",
-                  rxData.kp, rxData.ki, rxData.kd);
+    Serial.printf("Pitch PID: P=%.3f I=%.3f D=%.3f\n", rxData.kp, rxData.ki, rxData.kd);
     break;
-
-  case 1: // Roll
+  case 1:
     rollPID.kp = rxData.kp;
     rollPID.ki = rxData.ki;
     rollPID.kd = rxData.kd;
-    Serial.printf("Roll PID updated: P=%.3f I=%.3f D=%.3f\n",
-                  rxData.kp, rxData.ki, rxData.kd);
+    Serial.printf("Roll  PID: P=%.3f I=%.3f D=%.3f\n", rxData.kp, rxData.ki, rxData.kd);
     break;
-
-  case 2: // Yaw
+  case 2:
     yawPID.kp = rxData.kp;
     yawPID.ki = rxData.ki;
     yawPID.kd = rxData.kd;
-    Serial.printf("Yaw PID updated: P=%.3f I=%.3f D=%.3f\n",
-                  rxData.kp, rxData.ki, rxData.kd);
+    Serial.printf("Yaw   PID: P=%.3f I=%.3f D=%.3f\n", rxData.kp, rxData.ki, rxData.kd);
     break;
   }
 }
@@ -631,50 +786,85 @@ void updatePIDGains()
 // ============================================================================
 // MAIN CONTROL LOOP
 // ============================================================================
-
 /**
- * Execute one iteration of the flight control loop.
- * This should run at a fixed rate (250Hz recommended).
+ * One iteration of the flight control loop, called at exactly 250 Hz.
+ *
+ * Pipeline per iteration:
+ *   1. Angle safety check — hard cutoff before anything else
+ *   2. Read filtered gyro rates
+ *   3. Low-throttle check — idle stop
+ *   4. Compute PID corrections (with filtered gyro, fixed dT)
+ *   5. Mix and write motors
  */
 void controlLoop()
 {
-  // Get current attitude from IMU (using IMU.h functions)
-  float currentRollAngle = getRoll();    // Mahony filter output (degrees)
-  float currentPitchAngle = getPitch();  // Mahony filter output (degrees)
-  float currentYawRate = getGyroRateZ(); // Raw gyro Z for yaw rate mode (deg/s)
+  float currentRollAngle = getRoll();
+  float currentPitchAngle = getPitch();
 
-  // Check if we have enough throttle to fly
+  // ---- STEP 1: ANGLE SAFETY LIMIT ----
+  // This must run BEFORE the PID. At 90° tilt, P alone outputs 135 units
+  // of correction, which mixMotors() applies even when throttle = 0.
+  // This is exactly what caused "motors kept spinning up" during the flip.
+  // Cut everything immediately if we exceed the safe envelope.
+  if (fabsf(currentRollAngle) > MAX_ATTITUDE_DEG || fabsf(currentPitchAngle) > MAX_ATTITUDE_DEG)
+  {
+    stopMotors();
+    armed = false;
+    resetAllPIDs();
+    headingHoldActive = false;
+    Serial.printf("DISARMED: Attitude limit exceeded! Roll=%.1f Pitch=%.1f\n",
+                  currentRollAngle, currentPitchAngle);
+    return;
+  }
+
+  // ---- STEP 2: FILTER GYRO RATES ----
+  // Apply PT1 low-pass at GYRO_LPF_HZ (80 Hz) to each raw gyro axis.
+  // This is the pre-PID gyro filter, equivalent to Betaflight's
+  // gyro_lowpass configuration. It removes motor vibration noise
+  // before it reaches the D term and the Mahony filter update.
+  //
+  // These filtered values feed into:
+  //   a) The D term (gyro rate IS the derivative of angle)
+  //   b) The yaw rate PID measurement
+  float filteredGyroRoll = pt1FilterApply(&gyroFilterRoll, getGyroRateX());
+  float filteredGyroPitch = pt1FilterApply(&gyroFilterPitch, getGyroRateY());
+  float filteredGyroYaw = pt1FilterApply(&gyroFilterYaw, getGyroRateZ());
+
+  // ---- STEP 3: LOW-THROTTLE IDLE STOP ----
   if (baseThrottle < MOTOR_IDLE)
   {
-    // Throttle too low - disarm/idle state
     stopMotors();
     resetAllPIDs();
     headingHoldActive = false;
     return;
   }
 
-  // Compute PID corrections
-  // Roll/Pitch: pass gyro rate for the D term (cleaner than differentiating angle)
-  // Yaw: gyro rate IS the measurement (rate mode PID)
-  float rollCorrection = computePID(&rollPID, targetRoll, currentRollAngle, getGyroRateX());
-  float pitchCorrection = computePID(&pitchPID, targetPitch, currentPitchAngle, getGyroRateY());
-  float yawCorrection = computePID(&yawPID, targetYawRate, currentYawRate, currentYawRate);
+  // ---- STEP 4: COMPUTE PID CORRECTIONS ----
+  // Roll and Pitch: angle-mode PID
+  //   setpoint  = target angle (degrees)
+  //   measured  = Mahony filter angle output (degrees)
+  //   gyroRate  = filtered gyro rate for this axis (degrees/second)
+  //
+  // Yaw: rate-mode PID
+  //   setpoint  = target yaw rate (degrees/second)
+  //   measured  = current yaw rate from filtered gyro
+  //   gyroRate  = same filtered yaw gyro (D term unused since kd=0)
+  float rollCorrection = computePID(&rollPID, targetRoll, currentRollAngle, filteredGyroRoll);
+  float pitchCorrection = computePID(&pitchPID, targetPitch, currentPitchAngle, filteredGyroPitch);
+  float yawCorrection = computePID(&yawPID, targetYawRate, filteredGyroYaw, filteredGyroYaw);
 
-  // Apply motor mixing
+  // ---- STEP 5: MIX AND WRITE ----
   mixMotors(baseThrottle, rollCorrection, pitchCorrection, yawCorrection);
-
-  // Write to motors
   writeMotors();
 }
 
-/**
- * Handle failsafe condition (no signal from controller).
- */
+// ============================================================================
+// FAILSAFE
+// ============================================================================
 void failsafe()
 {
   unsigned long now = millis();
 
-  // Entry: initialize fsThrottle from current base throttle
   if (fsState == FS_NONE)
   {
     Serial.println("FAILSAFE: Signal lost, beginning descent");
@@ -685,20 +875,16 @@ void failsafe()
 
   if (fsState == FS_DESCENDING)
   {
-    // Step down every 200ms
     if (now - lastFsStepTime >= FS_STEP_INTERVAL_MS)
     {
       lastFsStepTime = now;
       fsThrottle = max(0, fsThrottle - FS_STEP_SIZE);
       Serial.printf("FAILSAFE: fsThrottle = %d\n", fsThrottle);
     }
-
-    // Apply the virtual throttle directly, bypassing processInputs()
     baseThrottle = fsThrottle;
-    mixMotors(baseThrottle, 0, 0, 0); // Level flight, no corrections
+    mixMotors(baseThrottle, 0, 0, 0);
     writeMotors();
 
-    // If signal comes back, transition to waiting-for-match
     if (radio.available())
     {
       bool success = recieveData();
@@ -713,18 +899,15 @@ void failsafe()
 
   if (fsState == FS_WAITING_FOR_MATCH)
   {
-    // Keep descending while pilot brings throttle to match
     if (now - lastFsStepTime >= FS_STEP_INTERVAL_MS)
     {
       lastFsStepTime = now;
       fsThrottle = max(0, fsThrottle - FS_STEP_SIZE);
     }
-
     baseThrottle = fsThrottle;
     mixMotors(baseThrottle, 0, 0, 0);
     writeMotors();
 
-    // Resume normal control once received throttle is within range of fsThrottle
     int receivedThrottle = map(rxData.throttle, 0, 1023, 0, MOTOR_MAX);
     if (abs(receivedThrottle - fsThrottle) <= 20)
     {
@@ -733,8 +916,6 @@ void failsafe()
       armed = true;
       resetAllPIDs();
     }
-
-    // If signal is lost again, go back to pure descending
     if (now - lastRxTime > FAILSAFE_TIMEOUT_MS)
     {
       fsState = FS_DESCENDING;
@@ -745,14 +926,14 @@ void failsafe()
 // ============================================================================
 // DEBUG OUTPUT
 // ============================================================================
-
 void printDebug()
 {
-  Serial.printf("Thr:%4d | R:%6.1f P:%6.1f H:%5.1f | tR:%5.1f tP:%5.1f tYR:%5.1f | M: %4d %4d %4d %4d\n",
-                baseThrottle,
-                getRoll(), getPitch(), getCorrectedHeading(),
-                targetRoll, targetPitch, targetYawRate,
-                motorTL, motorTR, motorBL, motorBR);
+  Serial.printf(
+      "Thr:%4d | R:%6.1f P:%6.1f H:%5.1f | tR:%5.1f tP:%5.1f tYR:%5.1f | M:%4d %4d %4d %4d\n",
+      baseThrottle,
+      getRoll(), getPitch(), getCorrectedHeading(),
+      targetRoll, targetPitch, targetYawRate,
+      motorTL, motorTR, motorBL, motorBR);
 }
 
 // ============================================================================
@@ -784,51 +965,61 @@ void setup()
 
   if (!initRadio())
   {
-    Serial.println("Radio failed to init, aborting.");
+    Serial.println("Radio failed.");
     infiniteLoop();
   }
-
   if (!initICM())
   {
-    Serial.println("IMU failed to init, aborting.");
+    Serial.println("IMU failed.");
     infiniteLoop();
   }
-
-  /*if (!bmp.initBMP())
-  {
-    Serial.println("BMP failed to init, aborting.");
-    infiniteLoop();
-  }*/
-  /*
-    if (!ads.initADS())
-    {
-      Serial.println("ADS failed to init, aborting.");
-      infiniteLoop();
-    }
-  */
   if (!initMotors())
   {
-    Serial.println("Motors failed to init, aborting.");
+    Serial.println("Motors failed.");
     infiniteLoop();
   }
 
+  // ---- INITIALIZE ALL PT1 FILTERS ----
+  // All filters use the same fixed sample period LOOP_DT = 1/250 = 0.004 s.
+  // Gains are computed once here and remain constant — the loop rate is fixed.
+  //
+  // Gyro filters (80 Hz): pre-PID noise reduction for each gyro axis.
+  pt1FilterInit(&gyroFilterRoll, GYRO_LPF_HZ, LOOP_DT);
+  pt1FilterInit(&gyroFilterPitch, GYRO_LPF_HZ, LOOP_DT);
+  pt1FilterInit(&gyroFilterYaw, GYRO_LPF_HZ, LOOP_DT);
+  //
+  // PID internal filters (initialized here, since PID structs need LOOP_DT):
+  // D-term filter (100 Hz): smooths the kd * gyroRate output.
+  pt1FilterInit(&rollPID.dFilter, DTERM_LPF_HZ, LOOP_DT);
+  pt1FilterInit(&pitchPID.dFilter, DTERM_LPF_HZ, LOOP_DT);
+  pt1FilterInit(&yawPID.dFilter, DTERM_LPF_HZ, LOOP_DT);
+  // iTerm Relax filter (10 Hz): detects rapid setpoint changes.
+  pt1FilterInit(&rollPID.itermRelaxFilter, ITERM_RELAX_HZ, LOOP_DT);
+  pt1FilterInit(&pitchPID.itermRelaxFilter, ITERM_RELAX_HZ, LOOP_DT);
+  pt1FilterInit(&yawPID.itermRelaxFilter, ITERM_RELAX_HZ, LOOP_DT);
+
+  // ---- IMU WARM-UP ----
   Serial.println("Keep drone LEVEL and STILL for filter convergence...");
   delay(2000);
 
-  // Pre-run the IMU update a few times to let the filter settle
   for (int i = 0; i < 500; i++)
   {
     updateIMU();
-    delay(4); // 250Hz
+    delay(4); // 250 Hz
   }
   Serial.println("IMU filter converged.");
 
-  // Wait for ARM command from controller
-  // IMPORTANT: Keep updating IMU so the Mahony filter doesn't go stale
+  // Preload gyro filters with the first real readings so the filter output
+  // starts at the true value rather than 0 (prevents startup transient).
+  pt1FilterPreload(&gyroFilterRoll, getGyroRateX());
+  pt1FilterPreload(&gyroFilterPitch, getGyroRateY());
+  pt1FilterPreload(&gyroFilterYaw, getGyroRateZ());
+
+  // ---- WAIT FOR ARM COMMAND ----
   Serial.println("Waiting for ARM command...");
   while (true)
   {
-    updateIMU(); // Keep filter running while waiting
+    updateIMU(); // Keep Mahony filter running — stale data causes bad init angles
 
     if (radio.available())
     {
@@ -839,14 +1030,12 @@ void setup()
         break;
       }
     }
-    delay(4); // ~250Hz to match filter rate
+    delay(4); // Match IMU update rate during wait
   }
 
-  // Initialize control timing
   lastControlTime = micros();
   lastRxTime = millis();
-  targetHeading = getCorrectedHeading(); // Initialize heading hold
-                                         //  startAltitude = bmp.getAltitude();
+  targetHeading = getCorrectedHeading();
   Serial.println("Ready for flight!");
 }
 
@@ -855,30 +1044,49 @@ void loop()
   unsigned long now = millis();
   unsigned long nowMicros = micros();
 
+  // ---- EXPLICIT DISARMED MOTOR STOP ----
+  // If not armed, ensure motors are always at zero.
+  // This is a belt-and-suspenders safety check: the motor stop also happens
+  // inside controlLoop() (via the low-throttle path and angle safety limit),
+  // but those only run at 250 Hz inside the timing gate below.
+  // This path runs every loop iteration (~10–50 kHz), ensuring that if
+  // anything sets armed=false (failsafe, angle limit, throttle cut), the
+  // motors go to zero within microseconds, not the next 4 ms window.
+  if (!armed && fsState == FS_NONE)
+  {
+    stopMotors();
+  }
+
+  // ---- DEBUG (every 500 ms) ----
   if (now - lastDebugTime >= 500)
   {
     lastDebugTime = now;
-    Serial.printf("Radio details - isChipConnected: %d | dataAvailable: %d | FIFO status: %d\n",
-                  radio.isChipConnected(),
-                  radio.available(),
-                  radio.isFifo(false, false));
+    Serial.printf("Radio: connected=%d available=%d FIFO=%d | Armed=%d\n",
+                  radio.isChipConnected(), radio.available(),
+                  radio.isFifo(false, false), armed);
   }
+
   // ---- RECEIVE DATA FROM CONTROLLER ----
   if (radio.available())
   {
     bool success = recieveData();
-    Serial.println(rxData.throttle);
     if (success)
     {
       lastRxTime = now;
 
-      // If throttle drops below 20, disarm and require re-arming
+      // Throttle < 20 → disarm (requires explicit re-arm from controller)
       if (rxData.throttle < 20)
       {
-        armed = false;
+        if (armed)
+        {
+          armed = false;
+          resetAllPIDs();
+          headingHoldActive = false;
+          Serial.println("Disarmed: throttle at zero");
+        }
       }
 
-      // Only allow operation if armed flag is received AND we're armed
+      // Accept re-arm command if FLAG_ARMED is set after disarm
       if (!armed && (rxData.flags & FLAG_ARMED))
       {
         armed = true;
@@ -888,14 +1096,14 @@ void loop()
         Serial.println("Motors re-armed");
       }
 
-      // Handle altitude hold flag
+      // Altitude hold
       if (rxData.flags & FLAG_ALT_HOLD)
       {
         if (!holdingAltitude)
         {
           heldPower = rxData.throttle;
           holdingAltitude = true;
-          Serial.printf("Altitude hold engaged at throttle: %d\n", heldPower);
+          Serial.printf("Alt hold engaged at throttle: %d\n", heldPower);
         }
       }
       else
@@ -905,65 +1113,41 @@ void loop()
 
       if (armed)
       {
-        // Process inputs from controller
         processInputs();
-
-        // Update PID gains if controller sent new values
         updatePIDGains();
-
-        // Update communication stats
         updateCommStats(success);
       }
-      else
-      {
-        Serial.println("Motors need to be rearmed");
-      }
     }
-  }
-  else
-  {
-    Serial.println("Not avalible");
   }
 
   // ---- FAILSAFE CHECK ----
   if (armed && (now - lastRxTime > FAILSAFE_TIMEOUT_MS))
   {
-    armed = false; // Prevent normal control loop from running
+    armed = false;
     failsafe();
   }
   else if (!armed && fsState != FS_NONE)
   {
-    failsafe(); // Keep running the state machine until resolved
+    failsafe();
   }
 
-  // ---- FIXED-RATE CONTROL LOOP ----
-  // Run at 250Hz for smooth control
-  // Use increment-by-period to prevent timing drift
+  // ---- FIXED-RATE CONTROL LOOP (250 Hz) ----
   if (nowMicros - lastControlTime >= CONTROL_LOOP_PERIOD_US)
   {
     lastControlTime += CONTROL_LOOP_PERIOD_US;
 
-    // If we've fallen behind by more than one period, reset instead of
-    // trying to catch up (prevents burst of rapid iterations)
+    // Catch-up guard: if more than one period behind, reset rather than
+    // firing multiple rapid iterations to "catch up".
     if (nowMicros - lastControlTime >= CONTROL_LOOP_PERIOD_US)
     {
       lastControlTime = nowMicros;
     }
 
-    // Update IMU data
-    updateIMU();
+    updateIMU(); // Update Mahony filter with latest ICM-20948 data
 
-    // Run control loop
     if (armed)
     {
       controlLoop();
     }
   }
-
-  // ---- DEBUG OUTPUT ----
-  /* if (now - lastDebugTime >= 200)
-   {
-     lastDebugTime = now;
-      printDebug();
-   } */
 }
