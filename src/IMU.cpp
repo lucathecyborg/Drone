@@ -3,226 +3,284 @@
 #include "IMU.h"
 
 // ============================================================================
-// GLOBAL STATE
+// GLOBALS
 // ============================================================================
-float currentRoll = 0;
-float currentPitch = 0;
-float currentYaw = 0;
+float currentRoll = 0.0f;
+float currentPitch = 0.0f;
+float currentYaw = 0.0f;
 
-float gyroRateX = 0;
-float gyroRateY = 0;
-float gyroRateZ = 0;
+// Body-frame gyro rates (deg/s), bias-corrected
+float gyroRateX = 0.0f; // roll rate
+float gyroRateY = 0.0f; // pitch rate
+float gyroRateZ = 0.0f; // yaw rate
 
-// Gyro bias: constant offset measured at startup while drone is still.
-// Subtracted from every gyro reading before it reaches the filter or PID.
-float gyroBiasX = 0;
-float gyroBiasY = 0;
-float gyroBiasZ = 0;
+// Gyro bias (zero-rate offset), computed during calibration in initICM()
+float gyroBiasX = 0.0f;
+float gyroBiasY = 0.0f;
+float gyroBiasZ = 0.0f;
 
-ICM_20948_I2C imu;
+Adafruit_ICM20948 imu;
 Adafruit_Mahony filter;
 
+// Counts how many updateIMU() calls have happened — used to switch Kp from
+// convergence value down to flight value after MAHONY_CONVERGENCE_STEPS.
+static uint32_t imuCallCount = 0;
+static bool convergenceDone = false;
+
 // ============================================================================
-// INIT
+// initICM()
+// ============================================================================
+// Initialises the sensor, configures ranges and DLPF, calibrates gyro bias,
+// and starts the Mahony filter at the high convergence gain.
+// Call once from setup(). Drone must be stationary during this call.
 // ============================================================================
 bool initICM()
 {
-    imu.begin(Wire, AD0_VAL);
-
-    if (imu.status != ICM_20948_Stat_Ok)
+    // ── I2C init ─────────────────────────────────────────────────────────────
+    // Default address is 0x69 (AD pin floating/high on Adafruit board).
+    // If AD pin is pulled low, use: imu.begin_I2C(0x68, &Wire)
+    if (!imu.begin_I2C())
     {
-        Serial.print("ICM-20948 init failed: ");
-        Serial.println(imu.statusString());
+        Serial.println("[IMU] ICM-20948 not found — check wiring / I2C address.");
         return false;
     }
 
-    // ---- FULL SCALE RANGES ----
-    // ±8g accel: good range for drones (rarely exceed 4–5g in normal flight).
-    // ±2000°/s gyro: safe for crash scenarios. Resolution is ~0.061 °/s per LSB.
-    // Note: if first flights are gentle, ±500°/s gives 4× better resolution
-    // (~0.015 °/s per LSB) with no other changes needed.
-    ICM_20948_fss_t fss;
-    fss.a = gpm8;   // ±8g
-    fss.g = dps500; // ±500°/s — 4× better resolution than ±2000°/s (~0.015°/s per LSB)
-                    // Safe because MAX_ATTITUDE_DEG disarms before a full tumble occurs.
-                    // Switch back to dps2000 only if you move to aggressive acrobatic flying.
-    imu.setFullScale(ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr, fss);
+    // ── Sensor ranges ────────────────────────────────────────────────────────
+    // ±8 g  — enough headroom for drone manoeuvres without saturating
+    imu.setAccelRange(ICM20948_ACCEL_RANGE_8_G);
 
-    // ---- HARDWARE DIGITAL LOW-PASS FILTER ----
-    // This runs on the ICM-20948 chip itself before data is sent over I2C.
-    // It is the most effective and cheapest noise reduction available —
-    // zero CPU cost, no code-level timing dependency, purely hardware.
-    //
-    // The filter must be enabled separately from being configured.
-    // Doing both in the same init block ensures they stay in sync.
-    //
-    // Gyro DLPF: 119.5 Hz bandwidth (gyr_d119bw5_n154bw3)
-    //   - Attenuates propeller/motor noise (typically 150–400 Hz) before
-    //     it reaches the Mahony filter or the PID D term.
-    //   - Phase lag at our loop frequency (250 Hz) is negligible.
-    //
-    // Accel DLPF: 111.4 Hz bandwidth (acc_d111bw4_n136bw)
-    //   - Removes high-frequency vibration from the accelerometer reading.
-    //   - This directly improves the Mahony filter's accel correction vector,
-    //     since Kp now amplifies a cleaner signal.
-    //
-    // Reference: ICM-20948 Product Specification Rev 1.3, Section 5.3
-    //            (Register GYRO_CONFIG_1, ACCEL_CONFIG)
-    ICM_20948_dlpcfg_t dlpConfig;
-    dlpConfig.g = GYRO_DLPF_SETTING;
-    dlpConfig.a = ACCEL_DLPF_SETTING;
-    imu.setDLPFcfg(ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr, dlpConfig);
-    imu.enableDLPF(ICM_20948_Internal_Gyr, true);
-    imu.enableDLPF(ICM_20948_Internal_Acc, true);
+    // ±2000 °/s — full agility for aerobatic flying
+    imu.setGyroRange(ICM20948_GYRO_RANGE_2000_DPS);
 
-    if (imu.status != ICM_20948_Stat_Ok)
+    // ── On-chip DLPF (hardware low-pass filter) ───────────────────────────────
+    // The rate divisor controls the ODR of the sensor.
+    // A divisor of 0 gives maximum ODR (1.1 kHz for gyro, 4.5 kHz for accel
+    // before the DLPF). We run at 250 Hz in software so we want the hardware
+    // DLPF to be set narrower than 125 Hz (Nyquist) to avoid aliasing.
+    //
+    // Divisor formula: ODR = base_rate / (1 + divisor)
+    // Gyro base rate (DLPF on): ~1125 Hz. Divisor=3 → ~281 Hz internal rate.
+    // At 281 Hz internal rate with the chip's DLPF engaged, the 3dB corner is
+    // around 111 Hz — which sits just above our 250 Hz loop Nyquist (125 Hz).
+    // This is intentional: we do our own PT1 filtering at 80 Hz in drone_main.
+    //
+    // Note: setGyroRateDivisor and setAccelRateDivisor also enable the DLPF
+    // automatically on the ICM-20948.
+    imu.setGyroRateDivisor(3);
+    imu.setAccelRateDivisor(3);
+
+    // ── Gyro bias calibration ─────────────────────────────────────────────────
+    // Collect GYRO_CAL_SAMPLES readings while the drone is stationary.
+    // The average is the zero-rate offset and is subtracted from all future reads.
+    Serial.println("[IMU] Calibrating gyro bias — keep drone still...");
     {
-        Serial.print("DLPF config failed: ");
-        Serial.println(imu.statusString());
-        return false;
+        double sumX = 0, sumY = 0, sumZ = 0;
+        sensors_event_t a, g, m, t;
+        constexpr float kRadToDeg = 57.29577951f;
+
+        for (int i = 0; i < GYRO_CAL_SAMPLES; i++)
+        {
+            // Wait for fresh data — poll until getEvent returns true
+            while (!imu.getEvent(&a, &g, &t, &m))
+            {
+                delayMicroseconds(100);
+            }
+
+            // Accumulate in chip frame (we remap after computing bias)
+            sumX += g.gyro.x;
+            sumY += g.gyro.y;
+            sumZ += g.gyro.z;
+
+            delayMicroseconds(3000); // ~333 Hz — faster than loop, good sample density
+        }
+
+        // Average, convert to deg/s, then apply the same chip→body remap
+        // that updateIMU() will use (chip Y → body X, chip X → body Y)
+        // so the bias is directly subtractable in body frame.
+        float rawBiasChipX = (float)(sumX / GYRO_CAL_SAMPLES) * kRadToDeg;
+        float rawBiasChipY = (float)(sumY / GYRO_CAL_SAMPLES) * kRadToDeg;
+        float rawBiasChipZ = (float)(sumZ / GYRO_CAL_SAMPLES) * kRadToDeg;
+
+        // body X = chip Y, body Y = chip X, body Z = -chip Z
+        gyroBiasX = rawBiasChipY;  // roll  bias
+        gyroBiasY = rawBiasChipX;  // pitch bias
+        gyroBiasZ = -rawBiasChipZ; // yaw   bias
+
+        Serial.printf("[IMU] Gyro bias (body frame, deg/s): X=%.4f  Y=%.4f  Z=%.4f\n",
+                      gyroBiasX, gyroBiasY, gyroBiasZ);
     }
 
-    // ---- CONTINUOUS SAMPLING ----
-    imu.setSampleMode(ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr,
-                      ICM_20948_Sample_Mode_Continuous);
-
-    // ---- MAHONY FILTER INIT ----
-    // Rate must match the actual update rate in updateIMU().
-    // Kp = 0.5 (Adafruit default) — trusts accel for tilt correction
-    //                               without amplifying vibration noise.
-    // Ki = 0.005 — slowly estimates and corrects residual gyro bias.
-    filter.begin(250);
-    filter.setKp(MAHONY_KP);
+    // ── Mahony filter ─────────────────────────────────────────────────────────
+    // Start at high Kp for fast convergence, Ki for gyro bias integration.
+    // Kp will be lowered to MAHONY_KP_FLIGHT after MAHONY_CONVERGENCE_STEPS.
+    filter.begin(250); // sample rate must match loop rate
+    filter.setKp(MAHONY_KP_CONVERGENCE);
     filter.setKi(MAHONY_KI);
 
-    Serial.println("ICM-20948 initialised");
-    Serial.printf("  Gyro DLPF: 119.5 Hz | Accel DLPF: 111.4 Hz\n");
-    Serial.printf("  Mahony Kp=%.3f  Ki=%.4f\n", MAHONY_KP, MAHONY_KI);
+    imuCallCount = 0;
+    convergenceDone = false;
 
-    // ---- GYRO BIAS CALIBRATION ----
-    // Collect GYRO_CALIB_SAMPLES readings while the drone is perfectly still.
-    // Average them to find the resting offset, then subtract it from every
-    // subsequent reading.
-    //
-    // This is called during setup() before armMotors(), at which point the
-    // drone has already been sitting still for 2+ seconds (IMU warm-up delay).
-    // The calibration itself takes 512 / 250Hz ≈ 2 seconds.
-    //
-    // Important: the main.cpp warm-up loop already runs 500 updateIMU()
-    // calls before reaching this point, so the hardware DLPF output has
-    // settled. Calibration samples are therefore DLPF-filtered, which is
-    // what we want — we're calibrating the bias of the filtered signal,
-    // not the raw signal.
-    Serial.println("Calibrating gyro bias — keep drone still...");
-    double sumX = 0, sumY = 0, sumZ = 0;
-    int collected = 0;
-
-    while (collected < GYRO_CALIB_SAMPLES)
-    {
-        if (imu.dataReady())
-        {
-            imu.getAGMT();
-            sumX += imu.gyrX();
-            sumY += imu.gyrY();
-            sumZ += imu.gyrZ();
-            collected++;
-        }
-        delay(1); // ~1 kHz polling, we stop at 512 samples
-    }
-
-    gyroBiasX = (float)(sumX / GYRO_CALIB_SAMPLES);
-    gyroBiasY = (float)(sumY / GYRO_CALIB_SAMPLES);
-    gyroBiasZ = (float)(sumZ / GYRO_CALIB_SAMPLES);
-
-    Serial.printf("  Gyro bias: X=%.3f  Y=%.3f  Z=%.3f deg/s\n",
-                  gyroBiasX, gyroBiasY, gyroBiasZ);
-
-    // Sanity check: if bias is unusually large the drone wasn't still,
-    // or the IMU has a hardware fault.
-    if (fabsf(gyroBiasX) > 5.0f || fabsf(gyroBiasY) > 5.0f || fabsf(gyroBiasZ) > 5.0f)
-    {
-        Serial.println("WARNING: Gyro bias > 5 deg/s — was the drone still during calibration?");
-        // Not a hard failure — continue with whatever was measured.
-    }
+    Serial.printf("[IMU] Mahony started: Kp=%.1f (convergence)  Ki=%.3f\n",
+                  MAHONY_KP_CONVERGENCE, MAHONY_KI);
+    Serial.printf("[IMU] Will drop to Kp=%.2f after %d calls (~%.1f s)\n",
+                  MAHONY_KP_FLIGHT,
+                  MAHONY_CONVERGENCE_STEPS,
+                  MAHONY_CONVERGENCE_STEPS / 250.0f);
 
     return true;
 }
 
 // ============================================================================
-// UPDATE (call at 250 Hz from the fixed-rate loop in main.cpp)
+// updateIMU()   — call at exactly 250 Hz
+// ============================================================================
+//
+// Pipeline per call:
+//   1. Read sensor data
+//   2. Remap chip axes → drone body frame
+//   3. Subtract gyro bias (removes zero-rate offset)
+//   4. Gate accelerometer (only trust accel within 0.9–1.1 g)
+//   5. AK09916 → body frame magnetometer remap
+//   6. Run Mahony filter (gyro always; accel/mag only if gated in)
+//   7. Step-down Kp from convergence → flight value after warmup
+//   8. Export roll/pitch/yaw
+//
 // ============================================================================
 void updateIMU()
 {
-    if (!imu.dataReady())
+    sensors_event_t accel_evt, gyro_evt, mag_evt, temp_evt;
+
+    if (!imu.getEvent(&accel_evt, &gyro_evt, &temp_evt, &mag_evt))
     {
-        // The ICM-20948 outputs at the rate configured by setSampleMode.
-        // At 250 Hz, this should essentially never be false when called on time.
-        // If it is, the filter was not updated this iteration — which means
-        // the Mahony integration step ran with a stale gyro rate.
-        // We do not skip silently; the caller (main.cpp) can decide what to do.
-        // For flight controllers, the standard approach is to still call
-        // filter.update() with the last known rates rather than skipping,
-        // because an entirely missing update step is worse than a repeated one.
-        // However, our hardware DLPF + 250 Hz loop rate makes this very rare.
-        return;
+        return; // No fresh data — skip this call
     }
 
-    imu.getAGMT(); // Read accel, gyro, mag, temperature in one burst
+    constexpr float kRadToDeg = 57.29577951f; // 180 / π
+    constexpr float kG = 9.80665f;            // m/s² per g
 
-    // ---- BIAS-CORRECTED GYRO RATES ----
-    // Subtract the resting offset measured during calibration.
-    // This is the coarse correction; Mahony's Ki handles residual drift.
-    // Units: degrees per second (SparkFun library returns deg/s directly).
-    gyroRateX = imu.gyrX() - gyroBiasX;
-    gyroRateY = imu.gyrY() - gyroBiasY;
-    gyroRateZ = imu.gyrZ() - gyroBiasZ;
-
-    // ---- ACCELEROMETER ----
-    // SparkFun returns milligrams (mg). Convert to m/s² for Adafruit AHRS.
-    // 1 mg = 0.001 g = 0.001 × 9.81 m/s²
-    float ax = (imu.accX() * 0.001f * 9.81f - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
-    float ay = (imu.accY() * 0.001f * 9.81f - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
-    float az = (imu.accZ() * 0.001f * 9.81f - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
-
-    // ---- MAGNETOMETER AXIS ALIGNMENT ----
-    // The AK09916 magnetometer embedded in the ICM-20948 has a different
-    // physical axis orientation than the accelerometer/gyro block.
-    // Without alignment, the heading computed by Mahony will be wrong,
-    // and heading hold / yaw correction will drift or be mirrored.
+    // ── STEP 1: Chip → body frame remap ─────────────────────────────────────
     //
-    // The correct remapping (PX4 AHRS and SparkFun documentation):
-    //   mag_x_corrected =  mag.y
-    //   mag_y_corrected =  mag.x
-    //   mag_z_corrected = -mag.z
+    // Chip silkscreen (see IMU.h header for full diagram):
+    //   chip X → drone RIGHT  = body Y (roll axis)
+    //   chip Y → drone FRONT  = body X (pitch axis)
+    //   chip Z → UP           = -body Z (body Z is down in NED)
     //
-    // This aligns the magnetometer axes to the ICM-20948 accel/gyro frame
-    // so that the Mahony filter receives a consistent coordinate system.
-    // Reference: SparkFun ICM-20948 Hookup Guide, "Magnetometer Alignment"
-    //            PX4 icm20948_mag driver (src/drivers/imu/icm20948/AK09916.cpp)
-    float mx = imu.magY();
-    float my = imu.magX();
-    float mz = -imu.magZ();
+    // Gyro: Adafruit ICM20X returns rad/s — convert to deg/s here.
+    float rawRoll = gyro_evt.gyro.y * kRadToDeg;  // chip Y → body X (roll)
+    float rawPitch = gyro_evt.gyro.x * kRadToDeg; // chip X → body Y (pitch)
+    float rawYaw = -gyro_evt.gyro.z * kRadToDeg;  // chip Z negated → body Z (yaw)
 
-    // ---- MAHONY FILTER UPDATE ----
-    // Gyro in deg/s (bias-corrected).
-    // Accel in m/s².
-    // Mag in µT (SparkFun returns µT; Adafruit AHRS accepts any consistent unit).
-    filter.update(
-        gyroRateX, gyroRateY, gyroRateZ,
-        ax, ay, az,
-        mx, my, mz);
+    // ── STEP 2: Subtract gyro bias ───────────────────────────────────────────
+    // Bias was computed in initICM() in the same body frame, so subtraction is direct.
+    gyroRateX = rawRoll - gyroBiasX;
+    gyroRateY = rawPitch - gyroBiasY;
+    gyroRateZ = rawYaw - gyroBiasZ;
 
+    // ── STEP 3: Accel remap (chip → body frame, same rule as gyro) ───────────
+    // Adafruit ICM20X returns m/s² directly — no unit conversion needed.
+    float ax = accel_evt.acceleration.y;  // chip Y → body X
+    float ay = accel_evt.acceleration.x;  // chip X → body Y
+    float az = -accel_evt.acceleration.z; // chip Z negated → body Z (down)
+
+    // ── STEP 4: Accel gating (Betaflight / PX4 technique) ───────────────────
+    //
+    // The Mahony filter uses the accelerometer to correct roll and pitch by
+    // comparing the measured gravity vector with the estimated one. This only
+    // works when the accelerometer is actually measuring gravity.
+    //
+    // During flight, centrifugal forces, motor vibration, and aerodynamic
+    // loads push the total acceleration away from 1 g. Feeding corrupted
+    // accel data into the filter degrades attitude accuracy.
+    //
+    // Solution: only trust the accel when the magnitude is within ±10% of 1 g.
+    // Outside that band the filter runs on gyro integration only for that step.
+    //
+    // Reference: betaflight/src/main/flight/imu.c — imuMahonyAHRSupdate()
+    //            PX4: src/lib/ecl/attitude_fw/ecl_fw_pos_controller.cpp
+    //
+    float accelMagSq = ax * ax + ay * ay + az * az;
+    float accelMagG = sqrtf(accelMagSq) / kG; // in units of g
+
+    bool accelValid = (accelMagG > ACCEL_GATE_LOW_G) &&
+                      (accelMagG < ACCEL_GATE_HIGH_G);
+
+    // ── STEP 5: Magnetometer remap ───────────────────────────────────────────
+    //
+    // The AK09916 embedded magnetometer has a different axis convention from
+    // the ICM-20948 accel/gyro. The standard PX4 alignment is:
+    //   mag_icm_frame = (mag.y, mag.x, -mag.z)
+    //
+    // Then applying our chip→body swap (chip Y → body X, chip X → body Y):
+    //   body frame mag = (mag_icm.y, mag_icm.x, -mag_icm.z)
+    //                  = (mag.x, mag.y, mag.z) after double-swap cancels XY
+    //
+    // Wait — let's be explicit. PX4 gives us ICM-frame mag as:
+    //   icm_mx = mag.y,  icm_my = mag.x,  icm_mz = -mag.z
+    // Then chip→body: body_X = icm_Y = mag.x,  body_Y = icm_X = mag.y
+    //   body_mx =  mag.x
+    //   body_my =  mag.y
+    //   body_mz =  mag.z   (the two negations cancel: -mag.z from PX4, then
+    //                        -body_Z from our Z flip → double negative = positive)
+    //
+    // Note: if yaw is still noisy after flashing, try swapping back to
+    //   (mag.y, mag.x, -mag.z) — the exact alignment can vary by board revision.
+    float mx = mag_evt.magnetic.x;
+    float my = mag_evt.magnetic.y;
+    float mz = mag_evt.magnetic.z;
+
+    // ── STEP 6: Mahony filter update ─────────────────────────────────────────
+    //
+    // The Adafruit Mahony filter takes:
+    //   gyro   in deg/s
+    //   accel  in m/s² (any consistent unit — it normalises internally)
+    //   mag    in any consistent unit (µT here)
+    //
+    // When accel is not valid we still pass it but set all components to zero
+    // so the filter's accel cross-product correction computes to zero — this
+    // is equivalent to gyro-only integration for this step.
+    //
+    if (accelValid)
+    {
+        filter.update(gyroRateX, gyroRateY, gyroRateZ,
+                      ax, ay, az,
+                      mx, my, mz);
+    }
+    else
+    {
+        // Gyro-only update — pass zero accel and mag so correction = 0.
+        // The filter still integrates the quaternion from gyro alone.
+        filter.update(gyroRateX, gyroRateY, gyroRateZ,
+                      0.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f);
+    }
+
+    // ── STEP 7: Kp step-down after convergence warmup ────────────────────────
+    //
+    // High Kp during the first MAHONY_CONVERGENCE_STEPS calls snaps the filter
+    // to the correct attitude quickly. Then we drop to the low flight Kp so the
+    // filter trusts the gyro more during dynamic motion.
+    //
+    imuCallCount++;
+    if (!convergenceDone && imuCallCount >= MAHONY_CONVERGENCE_STEPS)
+    {
+        filter.setKp(MAHONY_KP_FLIGHT);
+        convergenceDone = true;
+        Serial.printf("[IMU] Convergence done. Kp → %.2f (flight mode)\n",
+                      MAHONY_KP_FLIGHT);
+    }
+
+    // ── STEP 8: Export angles ─────────────────────────────────────────────────
     currentRoll = filter.getRoll();
     currentPitch = filter.getPitch();
     currentYaw = filter.getYaw();
 }
 
 // ============================================================================
-// ACCESSORS
+// Accessors
 // ============================================================================
 float getRoll() { return currentRoll; }
 float getPitch() { return currentPitch; }
 float getYaw() { return currentYaw; }
+
 float getGyroRateX() { return gyroRateX; }
 float getGyroRateY() { return gyroRateY; }
 float getGyroRateZ() { return gyroRateZ; }
