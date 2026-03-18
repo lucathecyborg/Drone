@@ -79,6 +79,13 @@
 // ============================================================================
 #define GYRO_CALIB_SAMPLES 512
 
+#define ACCEL_OFFSET_X -0.04868f
+#define ACCEL_OFFSET_Y 0.10216f
+#define ACCEL_OFFSET_Z 0.14659f
+#define ACCEL_SCALE_X -0.03678f
+#define ACCEL_SCALE_Y -0.00168f
+#define ACCEL_SCALE_Z 1.00454f
+
 // ============================================================================
 // FUNCTION DECLARATIONS
 // ============================================================================

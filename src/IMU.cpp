@@ -180,9 +180,9 @@ void updateIMU()
     // ---- ACCELEROMETER ----
     // SparkFun returns milligrams (mg). Convert to m/s² for Adafruit AHRS.
     // 1 mg = 0.001 g = 0.001 × 9.81 m/s²
-    float ax = imu.accX() * 0.001f * 9.81f;
-    float ay = imu.accY() * 0.001f * 9.81f;
-    float az = imu.accZ() * 0.001f * 9.81f;
+    float ax = (imu.accX() * 0.001f * 9.81f - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
+    float ay = (imu.accY() * 0.001f * 9.81f - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
+    float az = (imu.accZ() * 0.001f * 9.81f - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
 
     // ---- MAGNETOMETER AXIS ALIGNMENT ----
     // The AK09916 magnetometer embedded in the ICM-20948 has a different
