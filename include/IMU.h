@@ -1,130 +1,142 @@
 #pragma once
+#include <Adafruit_ICM20X.h>
 #include <Adafruit_ICM20948.h>
-#include <Adafruit_AHRS_Mahony.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
 
 // ============================================================================
-// BOARD ORIENTATION — READ BEFORE CHANGING AXIS MAPPINGS
+// I2C ADDRESS
 // ============================================================================
-//
-// Physical mounting (Adafruit ICM-20948 breakout, viewed from above on drone):
-//
-//                        FRONT of drone
-//                            ^^^
-//             [FS AD AC G SDO CS]   ← these pins face FRONT
-//             ┌─────────────────┐
-//             │  ICM20948       │
-//             │    ↑Y           │
-//             │    •→X          │   chip X → drone RIGHT
-//             │                 │   chip Y → drone FRONT
-//             │                 │   chip Z → UP (out of board)
-//             └─────────────────┘
-//             [VIN GND SDA SCL INT] ← these pins face BACK
-//                            vvv
-//                        BACK of drone
-//
-// Drone body-frame convention (NED — North/Forward-East/Right-Down):
-//   body X = forward  (pitch axis, nose-up positive)
-//   body Y = right    (roll axis,  right-wing-down positive)
-//   body Z = down     (yaw axis,   CW-from-above positive)
-//
-// Chip → body mapping:
-//   chip X (right)  → body Y  (roll axis)
-//   chip Y (front)  → body X  (pitch axis)
-//   chip Z (up)     → body Z via negation  (-chipZ = down = body Z)
-//
-// AK09916 magnetometer sits inside the ICM die with its own axis convention.
-// The standard PX4 remapping aligns it to the accel/gyro frame:
-//   mag_body_X =  mag.y
-//   mag_body_Y =  mag.x
-//   mag_body_Z = -mag.z
-// Then applying our chip→body swap on top of that.
-//
-// ============================================================================
+// Adafruit ICM-20948 board: AD0 pad floating/high → 0x69
+// Bridge the AD0 pad to GND for 0x68.
+#define ICM_I2C_ADDR 0x69
 
 // ============================================================================
-// MAHONY FILTER TUNING
+// HARDWARE DLPF
 // ============================================================================
-//
-// FLIGHT Kp (0.5):
-//   Low proportional gain during flight. Accel is corrupted by vibration and
-//   centrifugal forces — a low Kp means the filter mostly trusts the gyro
-//   during dynamic motion, only gently correcting toward the accel reference.
-//   Betaflight uses 0.25 when armed. 0.5 is a conservative starting point.
-//
-// CONVERGENCE Kp (10.0):
-//   High gain used for the first N seconds after init so the filter locks onto
-//   gravity quickly while the drone is still. Drops to FLIGHT_KP after warmup.
-//
-// Ki (0.005):
-//   Integral gain estimates and corrects the gyro's DC bias (zero-rate offset).
-//   Even a small Ki eliminates slow heading drift caused by gyro bias. Keep it
-//   very small — too large causes slow oscillation of the attitude estimate.
-//   Betaflight uses Ki only while spin rate is low to avoid windup in flight.
-//
+// On-chip filters. Run before data leaves the sensor — zero CPU cost.
+// Gyro:  119.5 Hz bandwidth  (ICM20X_GYRO_FREQ_119_5_HZ)
+// Accel: 111.4 Hz bandwidth  (ICM20X_ACCEL_FREQ_111_4_HZ)
+// Both stay well below the 125 Hz Nyquist limit of the 250 Hz loop.
+#define GYRO_DLPF_CUTOFF ICM20X_GYRO_FREQ_119_5_HZ
+#define ACCEL_DLPF_CUTOFF ICM20X_ACCEL_FREQ_111_4_HZ
+
 // ============================================================================
-#define MAHONY_KP_FLIGHT 0.5f
-#define MAHONY_KP_CONVERGENCE 10.0f
+// MAHONY FILTER GAINS
+// ============================================================================
+// MAHONY_KP_INIT: high gain for the first MAHONY_INIT_STEPS iterations.
+//   Pulls the quaternion from identity (flat) to the real attitude quickly.
+//   Source: madflight AHRS, Betaflight imuCalculateEstimatedAttitude().
+//   Both use a high initial Kp for ~2 s to avoid a slow startup convergence.
+//
+// MAHONY_KP: steady-state flight gain.
+//   0.5 is the x-io Technologies reference default (Mahony 2008 paper).
+//   Too high → motor vibration contaminates roll/pitch.
+//   Too low  → gyro drift is not corrected.
+//
+// MAHONY_KI: integral gain. Slowly removes residual gyro bias not caught by
+//   startup calibration (temperature drift etc.). 0.005 is safe.
+//
+// MAHONY_INIT_STEPS: how many update() calls to run at MAHONY_KP_INIT.
+//   250 Hz × 2 s = 500 steps.
+#define MAHONY_KP_INIT 10.0f
+#define MAHONY_KP 0.5f
 #define MAHONY_KI 0.005f
-
-// How many updateIMU() calls to run at high Kp before dropping to flight Kp.
-// At 250 Hz: 500 calls = 2 seconds of fast convergence.
-#define MAHONY_CONVERGENCE_STEPS 500
+#define MAHONY_INIT_STEPS 500
 
 // ============================================================================
-// ACCEL GATING — Betaflight / PX4 technique
+// ACCEL GATING
 // ============================================================================
-// During flight the accelerometer measures gravity PLUS centrifugal forces and
-// vibration. If the total acceleration magnitude deviates significantly from 1g,
-// the reading is unreliable for attitude correction and is discarded.
+// Only apply the accelerometer correction step when the measured acceleration
+// magnitude is between ACCEL_GATE_MIN and ACCEL_GATE_MAX m/s².
 //
-// Only feed accel into the Mahony correction when magnitude is within this band.
-// Values outside the band: the filter runs on gyro only for that iteration.
+// Source: madflight MAHONY_BF (Betaflight-flavoured Mahony), which gates
+//   accel correction to "rest only". The comment in madflight reads:
+//   "only use accel when close to 1g, otherwise centrifugal force etc."
 //
-// Betaflight uses 0.9–1.1g. PX4 uses the same. We match that.
-// ============================================================================
-#define ACCEL_GATE_LOW_G 0.9f  // Below this: free-fall or hard vibration
-#define ACCEL_GATE_HIGH_G 1.1f // Above this: thrust / centrifugal load
+// 0.9g = 8.83 m/s²   (lower bound)
+// 1.1g = 10.79 m/s²  (upper bound)
+//
+// During aggressive flight: motors vibrate, body accelerates laterally —
+//   the accel vector is far from 1g and should NOT be trusted.
+// At rest or gentle hover: accel ≈ 1g and is a reliable gravity reference.
+//
+// This is the single most impactful change for reducing attitude drift
+// during motor-on testing and flight.
+#define ACCEL_GATE_MIN 8.83f  // 0.9 × 9.81
+#define ACCEL_GATE_MAX 10.79f // 1.1 × 9.81
 
 // ============================================================================
 // GYRO BIAS CALIBRATION
 // ============================================================================
-// On startup (during IMU warmup, while the drone is stationary), we collect
-// GYRO_CAL_SAMPLES raw gyro readings and average them. This mean is the
-// zero-rate offset (bias) and is subtracted from every subsequent reading.
-//
-// This is the single most effective way to eliminate yaw/roll/pitch drift
-// when stationary. It does not help with temperature-dependent drift in flight,
-// but eliminates the constant-offset component entirely.
+#define GYRO_CALIB_SAMPLES 512 // ~2 s at 250 Hz
+
 // ============================================================================
-#define GYRO_CAL_SAMPLES 500
+// ACCELEROMETER CALIBRATION
+// ============================================================================
+// Re-measure with ACCEL_CALIBRATION.ino after confirming axes are correct.
+// Until then: offsets=0 / scales=1 = safe uncorrected state.
+#define ACCEL_OFFSET_X 0.0f
+#define ACCEL_OFFSET_Y 0.0f
+#define ACCEL_OFFSET_Z 0.0f
+#define ACCEL_SCALE_X 1.0f
+#define ACCEL_SCALE_Y 1.0f
+#define ACCEL_SCALE_Z 1.0f
+
+// ============================================================================
+// MAGNETOMETER HARD-IRON CALIBRATION
+// ============================================================================
+// Computed from full 360° flat yaw rotation using MAG_CHECK.ino.
+// Offsets = midpoint of (min, max) observed on each axis.
+// Re-run MAG_CHECK after confirming axes are correct.
+#define MAG_OFFSET_X -14.50f
+#define MAG_OFFSET_Y 13.50f
+#define MAG_OFFSET_Z 69.50f
+
+// ============================================================================
+// LOOP RATE
+// ============================================================================
+#define IMU_UPDATE_HZ 250.0f
+#define IMU_DT (1.0f / IMU_UPDATE_HZ) // 0.004 s
 
 // ============================================================================
 // FUNCTION DECLARATIONS
 // ============================================================================
-bool initICM();   // Init sensor + run gyro bias calibration
-void updateIMU(); // Call at 250 Hz — runs Mahony filter
+bool initICM();
+void updateIMU();
 
+// ---- Euler angles (degrees) ----
+// Sign conventions — VERIFY with visualizer before first flight:
+//   getRoll()  > 0 → right wing DOWN  (rolling clockwise from front)
+//   getPitch() > 0 → nose UP
+//   getYaw()   > 0 → nose turning RIGHT (CW from above), range 0–360
 float getRoll();
 float getPitch();
 float getYaw();
-float getGyroRateX(); // Bias-corrected, deg/s
+
+// ---- Gyro rates (degrees/second) ----
+// Sign conventions match the angle sign conventions above:
+//   getGyroRateX() > 0 → rolling right
+//   getGyroRateY() > 0 → pitching nose up
+//   getGyroRateZ() > 0 → turning right (CW from above)
+float getGyroRateX();
 float getGyroRateY();
 float getGyroRateZ();
 
-// ── Exported state ──────────────────────────────────────────────────────────
+// ============================================================================
+// SHARED STATE
+// ============================================================================
 extern float currentRoll;
 extern float currentPitch;
 extern float currentYaw;
 
-// Gyro rates in deg/s, bias-corrected, body frame (used by PID D-term)
-extern float gyroRateX; // roll rate  (right-wing-down positive)
-extern float gyroRateY; // pitch rate (nose-up positive)
-extern float gyroRateZ; // yaw rate   (CW-from-above positive)
+extern float gyroRateX;
+extern float gyroRateY;
+extern float gyroRateZ;
 
-// Calibrated gyro bias offsets (exported so drone_main can log them)
+// Gyro bias in rad/s, raw sensor frame, measured at startup
 extern float gyroBiasX;
 extern float gyroBiasY;
 extern float gyroBiasZ;
 
-extern Adafruit_ICM20948 imu;
-extern Adafruit_Mahony filter;
+extern Adafruit_ICM20948 icm;
