@@ -404,11 +404,7 @@ unsigned long lastFsStepTime = 0;
 /** Correct for inverted IMU board mounting. */
 float getCorrectedHeading()
 {
-  float rawYaw = getYaw();
-  float corrected = rawYaw + 180.0f;
-  if (corrected >= 360.0f)
-    corrected -= 360.0f;
-  return corrected;
+  return getYaw();
 }
 
 /**
