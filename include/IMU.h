@@ -89,9 +89,19 @@
 // Computed from full 360° flat yaw rotation using MAG_CHECK.ino.
 // Offsets = midpoint of (min, max) observed on each axis.
 // Re-run MAG_CHECK after confirming axes are correct.
-#define MAG_OFFSET_X -14.50f
-#define MAG_OFFSET_Y 13.50f
-#define MAG_OFFSET_Z 69.50f
+#define MAG_OFFSET_X -18.74f
+#define MAG_OFFSET_Y 17.48f
+#define MAG_OFFSET_Z 2.17f
+
+#define MAG_SCALE_XX +1.037f
+#define MAG_SCALE_XY +0.002f
+#define MAG_SCALE_XZ +0.001f
+#define MAG_SCALE_YX +0.002f
+#define MAG_SCALE_YY +0.942f
+#define MAG_SCALE_YZ -0.009f
+#define MAG_SCALE_ZX +0.001f
+#define MAG_SCALE_ZY -0.009f
+#define MAG_SCALE_ZZ +1.023f
 
 // ============================================================================
 // LOOP RATE

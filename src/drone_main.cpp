@@ -55,7 +55,7 @@
 // Motor speed limits (0–1000 internal scale)
 #define MOTOR_MIN 0
 #define MOTOR_MAX 1000
-#define MOTOR_IDLE 50 // Minimum speed considered "powered" for control purposes
+#define MOTOR_IDLE 120 // Minimum speed considered "powered" for control purposes — increased to keep ESCs in reliable operating zone
 
 // Flags sent from controller in rxData.flags
 #define FLAG_ARMED (1 << 0)
@@ -326,9 +326,9 @@ PIDController pitchPID = {
     .prevSetpoint = 0};
 
 PIDController yawPID = {
-    .kp = 2.0f,
+    .kp = 0.5f,
     .ki = 0.0f,
-    .kd = 0.0f, // D on yaw is usually 0 — yaw is slow and D adds noise
+    .kd = 0.15f, // Added D-term damping to smooth yaw response
     .integral = 0,
     .prevMeasurement = 0,
     .initialized = false,
@@ -373,7 +373,7 @@ unsigned long lastDebugTime = 0;
 // State
 bool armed = false;
 unsigned long lastRxTime = 0;
-#define FAILSAFE_TIMEOUT_MS 1000
+#define FAILSAFE_TIMEOUT_MS 3000
 
 // Heading hold
 float targetHeading = 0;
@@ -680,10 +680,10 @@ void stopMotors()
  */
 void mixMotors(int throttle, float roll, float pitch, float yaw)
 {
-  motorTL = throttle - pitch + roll - yaw; // front-left  CCW
-  motorTR = throttle - pitch - roll + yaw; // front-right CW
-  motorBL = throttle + pitch + roll + yaw; // back-left   CW
-  motorBR = throttle + pitch - roll - yaw; // back-right  CCW
+  motorTL = throttle - pitch - roll - yaw;
+  motorTR = throttle - pitch + roll + yaw;
+  motorBL = throttle + pitch - roll + yaw;
+  motorBR = throttle + pitch + roll - yaw;
 
   motorTL = constrain(motorTL, MOTOR_MIN, MOTOR_MAX);
   motorTR = constrain(motorTR, MOTOR_MIN, MOTOR_MAX);
@@ -698,7 +698,7 @@ void mixMotors(int throttle, float roll, float pitch, float yaw)
 #define MAX_ANGLE 30.0f // Maximum commanded angle (degrees)
 #define JOYSTICK_CENTER 512
 #define JOYSTICK_DEADBAND 30
-#define MAX_YAW_RATE 180.0f // Maximum commanded yaw rate (degrees/second)
+#define MAX_YAW_RATE 120.0f // Maximum commanded yaw rate (degrees/second) — reduced for smoother control
 #define YAW_DEADBAND 50
 
 void processInputs()
@@ -924,12 +924,8 @@ void failsafe()
 // ============================================================================
 void printDebug()
 {
-  Serial.printf(
-      "Thr:%4d | R:%6.1f P:%6.1f H:%5.1f | tR:%5.1f tP:%5.1f tYR:%5.1f | M:%4d %4d %4d %4d\n",
-      baseThrottle,
-      getRoll(), getPitch(), getCorrectedHeading(),
-      targetRoll, targetPitch, targetYawRate,
-      motorTL, motorTR, motorBL, motorBR);
+  Serial.printf("TL:%4d  TR:%4d  BL:%4d  BR:%4d\n",
+                motorTL, motorTR, motorBL, motorBR);
 }
 
 // ============================================================================
@@ -1057,9 +1053,7 @@ void loop()
   if (now - lastDebugTime >= 500)
   {
     lastDebugTime = now;
-    Serial.printf("Radio: connected=%d available=%d FIFO=%d | Armed=%d\n",
-                  radio.isChipConnected(), radio.available(),
-                  radio.isFifo(false, false), armed);
+    printDebug();
   }
 
   // ---- RECEIVE DATA FROM CONTROLLER ----
@@ -1076,6 +1070,7 @@ void loop()
         if (armed)
         {
           armed = false;
+          fsState = FS_NONE; // add this
           resetAllPIDs();
           headingHoldActive = false;
           Serial.println("Disarmed: throttle at zero");
@@ -1086,6 +1081,7 @@ void loop()
       if (!armed && (rxData.flags & FLAG_ARMED))
       {
         armed = true;
+        fsState = FS_NONE; // add this
         resetAllPIDs();
         headingHoldActive = false;
         targetHeading = getCorrectedHeading();

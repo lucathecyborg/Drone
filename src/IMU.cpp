@@ -318,10 +318,13 @@ void updateIMU()
 
     // Magnetometer (hard-iron corrected, raw sensor frame)
     // The AK09916 axes were verified to produce clean sine waves on MX and MY
-    // during a flat 360° yaw rotation. No additional remapping applied.
-    float mx = m_ev.magnetic.x - MAG_OFFSET_X;
-    float my = m_ev.magnetic.y - MAG_OFFSET_Y;
-    float mz = m_ev.magnetic.z - MAG_OFFSET_Z;
+    float mr_x = m_ev.magnetic.x - MAG_OFFSET_X;
+    float mr_y = m_ev.magnetic.y - MAG_OFFSET_Y;
+    float mr_z = m_ev.magnetic.z - MAG_OFFSET_Z;
+
+    float mx = MAG_SCALE_XX * mr_x + MAG_SCALE_XY * mr_y + MAG_SCALE_XZ * mr_z;
+    float my = MAG_SCALE_YX * mr_x + MAG_SCALE_YY * mr_y + MAG_SCALE_YZ * mr_z;
+    float mz = MAG_SCALE_ZX * mr_x + MAG_SCALE_ZY * mr_y + MAG_SCALE_ZZ * mr_z;
 
     // ---- RUN MAHONY FILTER ----
     // Accel gating and dynamic Kp are handled inside mahonyUpdate().

@@ -16,7 +16,7 @@ bool initRadio()
         return false;
     }
 
-    radio.setPALevel(RF24_PA_LOW);
+    radio.setPALevel(RF24_PA_HIGH);
     radio.setDataRate(RF24_250KBPS);
     radio.setChannel(125);
     radio.enableAckPayload();
