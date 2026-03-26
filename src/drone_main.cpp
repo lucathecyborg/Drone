@@ -395,7 +395,7 @@ FailsafeState fsState = FS_NONE;
 int fsThrottle = 0;
 unsigned long lastFsStepTime = 0;
 #define FS_STEP_INTERVAL_MS 200
-#define FS_STEP_SIZE 1
+#define FS_STEP_SIZE 20
 
 // ============================================================================
 // MAGNETOMETER HEADING UTILITIES
@@ -1064,13 +1064,20 @@ void loop()
     {
       lastRxTime = now;
 
+      if (fsState != FS_NONE && !(rxData.flags & FLAG_ARMED))
+      {
+        fsState = FS_NONE;
+        stopMotors();
+        resetAllPIDs();
+        Serial.println("Failsafe cancelled: signal restored, not armed");
+      }
       // Throttle < 20 → disarm (requires explicit re-arm from controller)
       if (rxData.throttle < 20)
       {
+
         if (armed)
         {
           armed = false;
-          fsState = FS_NONE; // add this
           resetAllPIDs();
           headingHoldActive = false;
           Serial.println("Disarmed: throttle at zero");
