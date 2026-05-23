@@ -45,7 +45,7 @@ bool validateChecksum(const message *msg)
     return (calculated == msg->checksum);
 }
 
-bool recieveData()
+bool recieveData(float batterypercent)
 {
 
     radio.read(&rxData, sizeof(rxData));
@@ -56,7 +56,7 @@ bool recieveData()
         return false;
     }
 
-    radio.writeAckPayload(1, &txBattery, sizeof(txBattery));
+    radio.writeAckPayload(1, &batterypercent, sizeof(batterypercent));
     return true;
 }
 

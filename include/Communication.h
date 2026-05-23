@@ -54,7 +54,7 @@ extern CommStats commStats;
 bool initRadio();
 uint8_t calculateChecksum(const message *msg);
 bool validateChecksum(const message *msg);
-bool recieveData();
+bool recieveData(float batteryPercent);
 void updateCommStats(bool recieved);
 void printCommStats();
 void printRecievedData();

@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "ADS1115.h"
 #include "Communication.h"
 #include "IMU.h"
 #include "BMP.h"
-#include "ADS1115.h"
 
 // ============================================================================
 // MOTOR CONFIGURATION
@@ -883,7 +883,15 @@ void failsafe()
 
     if (radio.available())
     {
-      bool success = recieveData();
+      if (ads.getBattery1Percent() > ads.getBattery2Percent())
+      {
+        txBattery = ads.getBattery2Percent();
+      }
+      else
+      {
+        txBattery = ads.getBattery1Percent();
+      }
+      bool success = recieveData(txBattery);
       if (success)
       {
         lastRxTime = now;
@@ -965,6 +973,11 @@ void setup()
     Serial.println("IMU failed.");
     infiniteLoop();
   }
+  if (!ads.initADS())
+  {
+    Serial.println("ADS failed.");
+    infiniteLoop();
+  }
   if (!initMotors())
   {
     Serial.println("Motors failed.");
@@ -1015,7 +1028,7 @@ void setup()
 
     if (radio.available())
     {
-      bool success = recieveData();
+      bool success = recieveData(txBattery);
       if (success && (rxData.flags & FLAG_ARMED))
       {
         armMotors();
@@ -1054,12 +1067,13 @@ void loop()
   {
     lastDebugTime = now;
     printDebug();
+    ads.updateBatteryVoltages();
   }
 
   // ---- RECEIVE DATA FROM CONTROLLER ----
   if (radio.available())
   {
-    bool success = recieveData();
+    bool success = recieveData(txBattery);
     if (success)
     {
       lastRxTime = now;
